@@ -3,7 +3,8 @@
     Removes the Microsoft Store codec packages that keep showing up in vulnerability scans - WebP Image Extension,
     HEVC Video Extensions, Raw Image Extension and HEIF Image Extensions by default - from a Windows 10/11 computer
     or from a mounted golden image: for every user profile, from the provisioning list, and with the registry key
-    that stops feature updates from bringing them back. Read-only by default (-Mode Check).
+    that stops feature updates from bringing them back. Read-only by default (-Mode Check). -ListPackages shows
+    every codec package the script can handle, its state, and the exact name to pass to -Package.
 
 .DESCRIPTION
     WHAT THESE PACKAGES ARE AND WHERE THEY COME FROM
@@ -43,6 +44,12 @@
                                                   AppxAllUserStore\Deprovisioned\<PackageFamilyName>
          and finally re-reads all three from the system to verify. No reboot is needed.
 
+    LISTING WHAT IS THERE
+      -ListPackages is read-only: it lists every package of the catalog with what is installed (for whom),
+      provisioned and keyed, marks the default targets, writes the list as CSV (with what each package decodes and
+      what stops working without it), and prints the -Mode Remove -Package command for the packages that are
+      present. With -MountedImagePath it lists the provisioning and keys of the mounted image.
+
     WHY "THE APP IS IN USE" AND WHY SYSTEM DOES NOT HELP
       Remove-AppxPackage fails with 0x80073D02 (ERROR_PACKAGES_IN_USE) when any process has a DLL from the package
       folder loaded. For the HEVC package that is normally Microsoft Edge and every WebView2 host (new Teams,
@@ -53,6 +60,13 @@
       processes: -Mode Check lists them, and -StopBlockingProcesses stops them (Explorer is restarted afterwards;
       system, security and management processes are never killed - the run refuses instead). On a golden-image
       build in audit mode nothing holds the files and the removal just works.
+
+    ACCESS DENIED (0x80070005) ALTHOUGH THE SESSION IS ELEVATED
+      The script checks elevation first, so this code comes from the app deployment service itself. Seen on
+      Windows 11 build 28000: Remove-AppxPackage -AllUsers on a package that was still provisioned removed it for the
+      other accounts and Windows deprovisioned it, but the service returned 0x80070005 for the signed-in account
+      (step "OptionalDependenciesHandled"). Running the same command again removed the remaining registration. The
+      FAIL row names the AppX activity; Get-AppPackageLog -ActivityID <id> shows Windows' own log of it.
 
     GOLDEN IMAGE
       Reference computer (audit mode, before sysprep /generalize): run -Mode Remove -NoConfirm there. Removing for
@@ -70,8 +84,8 @@
       open the Store can reinstall a package on their own; the script warns when the Store is not blocked by policy.
 
     EVIDENCE
-      Transcript and CSV of PASS/WARN/FAIL rows in -LogPath, an inventory JSON (before and after) in -OutputPath,
-      and Application events from source CodecExtensionRemoval: 1000 run started, 1001 package removed, 1002
+      Transcript and CSV of PASS/WARN/FAIL rows in -LogPath, an inventory JSON (before and after) in -OutputPath
+      (-ListPackages: the package list as CSV there), and Application events from source CodecExtensionRemoval: 1000 run started, 1001 package removed, 1002
       nothing to do, 2001 package in use, 2002 warning, 3000 run stopped, 3001 removal failed.
 
 .PARAMETER Mode
@@ -81,7 +95,13 @@
 .PARAMETER Package
     Package names to handle. Default: Microsoft.WebpImageExtension, Microsoft.HEVCVideoExtension,
     Microsoft.RawImageExtension, Microsoft.HEIFImageExtension. Only the codec packages listed in the catalog are
-    accepted. To keep HEIF, pass the first three names.
+    accepted. To keep HEIF, pass the first three names. -ListPackages shows every accepted name and its state.
+
+.PARAMETER ListPackages
+    Read-only. Lists every codec package the script can handle - the name to use with -Package, the Store listing,
+    whether it is a default target, and its state on this computer (or in -MountedImagePath) - writes the list to
+    <OutputPath>\codec-packages-<computer>-<timestamp>.csv and prints the removal command for the packages that are
+    present. Cannot be combined with -Mode, -Package, -StopBlockingProcesses or -NoConfirm.
 
 .PARAMETER MountedImagePath
     Offline servicing: the folder a Windows image is mounted at (Mount-WindowsImage -Path). Empty (default) means
@@ -113,6 +133,11 @@
     .\Remove-CodecExtension.ps1
     Read-only: which of the four packages are installed (for whom), provisioned, keyed, and which processes hold
     them. Exit code 1 while any is present.
+
+.EXAMPLE
+    .\Remove-CodecExtension.ps1 -ListPackages
+    Read-only: every codec package the script can handle, its state here, and the -Package name to use, followed by
+    the removal command for the ones that are present.
 
 .EXAMPLE
     .\Remove-CodecExtension.ps1 -Mode Remove -WhatIf
@@ -165,26 +190,41 @@
 .LINK
     https://learn.microsoft.com/troubleshoot/microsoft-edge/development/video-playback-issues
 #>
-[CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+[CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High', DefaultParameterSetName = 'Run')]
 param(
+    [Parameter(ParameterSetName = 'Run')]
     [ValidateSet('Check', 'Remove')]
     [string]$Mode = 'Check',
 
+    [Parameter(ParameterSetName = 'Run')]
     [ValidateSet('Microsoft.WebpImageExtension', 'Microsoft.HEVCVideoExtension', 'Microsoft.HEVCVideoExtensions', 'Microsoft.RawImageExtension', 'Microsoft.HEIFImageExtension', 'Microsoft.AV1VideoExtension', 'Microsoft.VP9VideoExtensions', 'Microsoft.MPEG2VideoExtension', 'Microsoft.WebMediaExtensions')]
     [string[]]$Package = @('Microsoft.WebpImageExtension', 'Microsoft.HEVCVideoExtension', 'Microsoft.RawImageExtension', 'Microsoft.HEIFImageExtension'),
 
+    [Parameter(Mandatory, ParameterSetName = 'List')]
+    [switch]$ListPackages,
+
     [string]$MountedImagePath = '',
+
+    [Parameter(ParameterSetName = 'Run')]
     [switch]$StopBlockingProcesses,
+
     [string]$LogPath = '',
     [string]$OutputPath = '',
 
     [ValidatePattern('^HK(LM|CU):\\\S+$')]
     [string]$DeprovisionedKeyRoot = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\Deprovisioned',
 
+    [Parameter(ParameterSetName = 'Run')]
     [switch]$NoConfirm
 )
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
+$RunKind = $Mode
+if ($ListPackages) { $RunKind = 'List' }
+# The command to suggest in hints, as the user would type it from the current folder (.\scripts\... or .\...).
+$CommandName = "$PSCommandPath"
+try { $CommandName = "$(Resolve-Path -LiteralPath $PSCommandPath -Relative -ErrorAction Stop)" } catch { $CommandName = "$PSCommandPath" }
+if ($CommandName -match '\s') { $CommandName = "& '$($CommandName -replace "'", "''")'" }
 $UnderHarness = $null -ne (Get-Variable -Name CodecRemovalHarness -ErrorAction SilentlyContinue)   # any visible scope: the harness calls through a function
 if (-not $UnderHarness) {
     . (Join-Path $PSScriptRoot 'Codec-Common.ps1')
@@ -205,7 +245,7 @@ if (-not $LogPath) { $LogPath = Join-Path $Root 'Logs' }
 if (-not $OutputPath) { $OutputPath = Join-Path $Root 'Outputs' }
 foreach ($Dir in @($LogPath, $OutputPath)) { if (-not (Test-Path -LiteralPath $Dir -PathType Container)) { New-Item -Path $Dir -ItemType Directory -Force -WhatIf:$false | Out-Null } }
 $Stamp = '{0:yyyyMMdd-HHmmss}' -f (Get-Date)
-$LogBase = Join-Path $LogPath "Remove-CodecExtension-$Mode-$Stamp"
+$LogBase = Join-Path $LogPath "Remove-CodecExtension-$RunKind-$Stamp"
 # PowerShell 7 applies -WhatIf to Start-Transcript and Stop-Transcript (the transcript would never open or close);
 # Windows PowerShell 5.1 has -WhatIf on Start-Transcript only. Pass -WhatIf:$false where the parameter exists.
 $StartNoWhatIf = @{}; $StopNoWhatIf = @{}
@@ -216,12 +256,36 @@ Start-Transcript -LiteralPath "$LogBase.log" @StartNoWhatIf | Out-Null
 $Results = New-Object System.Collections.Generic.List[object]
 function Add-Result([string]$Status, [string]$Check, [string]$Detail) { $Results.Add([pscustomobject]@{ Status = $Status; Check = $Check; Detail = $Detail }) }
 $Hints = New-Object System.Collections.Generic.List[string]
+$ActivityIds = New-Object System.Collections.Generic.List[string]
+$FailKind = @{}
 $Mutex = $null; $MutexHeld = $false
 $ExplorerStopped = $false
 $Offline = [bool]"$MountedImagePath".Trim()
 $DeprovisionedRelative = 'Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\Deprovisioned'
 
 function Format-Blocker([object[]]$Blocker) { return ((@($Blocker) | ForEach-Object { "$($_.ProcessName) (PID $($_.Id))" } | Select-Object -Unique) -join ', ') }
+
+# The arguments that select the given packages (and the same mounted image) again, for the commands in the hints.
+function Get-CodecRerunArgument([string[]]$Names) {
+    $Text = ''
+    if (@($Names | Where-Object { $_ }).Count -gt 0) { $Text += " -Package $(@($Names | Where-Object { $_ }) -join ', ')" }
+    if ($Offline) { $Text += " -MountedImagePath '$("$MountedImagePath".Trim() -replace "'", "''")'" }
+    return $Text
+}
+
+# A failed AppX call: the code from the message or the exception, plus Windows' own log entry for the failed step.
+function Get-CodecFailure([object]$ErrorRecord, [string]$PackageName, [datetime]$Since) {
+    $Why = ConvertTo-CodecHresultText -Message "$($ErrorRecord.Exception.Message)" -HResult ([int]$ErrorRecord.Exception.HResult)
+    $Activity = Find-CodecDeploymentError -PackageName $PackageName -Since $Since
+    $LogNote = ''
+    if ($null -ne $Activity -and "$($Activity.ActivityId)") {
+        $LogNote = " - Windows' log: $(if ($Activity.Step) { "$($Activity.Step) " })Get-AppPackageLog -ActivityID $($Activity.ActivityId)"
+        $ActivityIds.Add("$($Activity.ActivityId)")
+    }
+    $Kind = 'other'
+    if ($Why.Code -eq '0x80073D02') { $Kind = 'inuse' } elseif ($Why.Code -eq '0x80070005') { $Kind = 'denied' }
+    return [pscustomobject]@{ Code = $Why.Code; Text = $Why.Text; LogNote = $LogNote; Kind = $Kind }
+}
 
 # Stops the processes that hold a package file (never the ones Get-CodecBlockerAction refuses). Explorer is
 # remembered so it can be started again at the end.
@@ -291,192 +355,239 @@ try {
     if (-not $MutexHeld) { throw 'STOP: another instance of Remove-CodecExtension.ps1 is running on this computer. Wait for it to finish. Nothing was changed.' }
     $Modules = Initialize-CodecModules
     Add-Result OK 'Modules' "Appx: $($Modules.Appx); Dism: $($Modules.Dism)"
-    $Targets = @($Package | ForEach-Object { (Get-CodecCatalogEntry $_).Name } | Select-Object -Unique)
-    Add-Result OK 'Target packages' ($Targets -join ', ')
+    if ($ListPackages) { $Targets = @($CodecCatalog | ForEach-Object { $_.Name }) }
+    else {
+        $Targets = @($Package | ForEach-Object { (Get-CodecCatalogEntry $_).Name } | Select-Object -Unique)
+        Add-Result OK 'Target packages' ($Targets -join ', ')
+    }
     $Image = $null
     if ($Offline) {
         $Image = Test-CodecOfflineImage -Path $MountedImagePath
         Add-Result OK 'Mounted image' "$($Image.Path) - Windows build $($Image.Build) ($($Image.Version)) - provisioning and Deprovisioned keys only; user registrations in a captured image need the online run"
     }
 
-    # ---- 2. Current state (read-only) and the plan
-    $State = Read-CodecState
-    $Plan = @(Get-CodecPlan -Target $Targets -Installed $State.Installed -Provisioned $State.Provisioned -DeprovisionedKey $State.Keys)
-    $Blockers = @()
-    if (-not $Offline) { $Blockers = @(Get-CodecBlockingProcess -InstallLocation @($State.Installed | ForEach-Object { "$($_.InstallLocation)" } | Where-Object { $_ })) }
-    $BlockedNames = @($Blockers | ForEach-Object { ("$($_.Package)" -split '_')[0] } | Select-Object -Unique)
-    foreach ($P in $Plan) {
-        $Facts = New-Object System.Collections.Generic.List[string]
-        foreach ($I in $P.Installed) {
-            $Facts.Add("installed $($I.Version) for $(Get-CodecUserList $I)")
-            if ((Get-CodecFamilyName "$($I.PackageFullName)") -ne $P.FamilyName) { Add-Result WARN "$($P.Name) publisher" "$($I.PackageFullName) is not signed by the Microsoft Store publisher ID; it was sideloaded" }
+    if ($ListPackages) {
+        # ---- 2. List every catalog package (read-only) and the commands to remove the ones that are present
+        $State = Read-CodecState
+        $Listing = @(Get-CodecPackageListing -Installed $State.Installed -Provisioned $State.Provisioned -DeprovisionedKey $State.Keys -Offline:$Offline)
+        $ListFile = Join-Path $OutputPath "codec-packages-$($env:COMPUTERNAME)-$Stamp.csv"
+        $Listing | Select-Object Package, DisplayName, StoreId, DefaultTarget, Present, State, Installed, Provisioned, KeyPresent, Decodes, Breaks | Export-Csv -LiteralPath $ListFile -NoTypeInformation -Encoding UTF8 -WhatIf:$false
+        $Where = $env:COMPUTERNAME
+        if ($Offline) { $Where = "mounted image $($Image.Path)" }
+        Write-Host ''
+        Write-Host "Codec packages this script can remove - $Where" -ForegroundColor Cyan
+        $Listing | Select-Object @{ Name = 'Package (use with -Package)'; Expression = { $_.Package } }, @{ Name = 'Store listing'; Expression = { $_.DisplayName } }, @{ Name = 'Default'; Expression = { if ($_.DefaultTarget) { 'yes' } else { '' } } }, @{ Name = 'State'; Expression = { $_.State } } | Format-Table -AutoSize -Wrap | Out-String -Width 220 | Write-Host
+        # Default targets first, so the single-package example is the one a scanner most likely flagged
+        $PresentNames = @(@($Listing | Where-Object { $_.Present -and $_.DefaultTarget } | ForEach-Object { $_.Package }) + @($Listing | Where-Object { $_.Present -and -not $_.DefaultTarget } | ForEach-Object { $_.Package }))
+        Add-Result OK 'Package list' "$($Listing.Count) package(s) in the catalog, $($PresentNames.Count) present - $ListFile"
+        if ($PresentNames.Count -gt 0) {
+            $Hints.Add('Remove one package (asks Y/N first; add -WhatIf to see the plan only):')
+            $Hints.Add("  $CommandName -Mode Remove$(Get-CodecRerunArgument @($PresentNames[0]))")
+            if ($PresentNames.Count -gt 1) {
+                $Hints.Add("Remove all $($PresentNames.Count) present packages:")
+                $Hints.Add("  $CommandName -Mode Remove$(Get-CodecRerunArgument $PresentNames)")
+            }
+            $NotDefault = @($Listing | Where-Object { $_.Present -and -not $_.DefaultTarget } | ForEach-Object { $_.Package })
+            if ($NotDefault.Count -gt 0) { $Hints.Add("Not default targets: $($NotDefault -join ', '). The Breaks column of $ListFile says what stops working without each one.") }
         }
-        foreach ($V in $P.Provisioned) { $Facts.Add("provisioned $($V.Version) (every new user profile gets it)") }
-        if ($P.KeyPresent) { $Facts.Add('Deprovisioned key present') } else { $Facts.Add('no Deprovisioned key') }
-        $Mine = @($Blockers | Where-Object { "$($_.Package)" -like "$($P.Name)_*" })
-        if ($Mine.Count -gt 0) { $Facts.Add('IN USE by ' + ((@($Mine | ForEach-Object { "$($_.ProcessName) (PID $($_.Id)) $($_.Module)" }) | Select-Object -Unique) -join ', ')) }
-        $Line = ($Facts.ToArray() -join '; ')
-        if ($P.AlreadyClean) { Add-Result OK $P.Name 'not installed, not provisioned, Deprovisioned key present - nothing to do' }
-        elseif ($P.Present) { if ($Mode -eq 'Check') { Add-Result FAIL $P.Name "PRESENT - $Line" } else { Add-Result OK "$($P.Name) before" $Line } }
-        else { Add-Result WARN $P.Name "not installed and not provisioned, but $Line - a feature update may provision it again; -Mode Remove writes the key" }
-    }
-    if (-not $Offline) {
-        $Store = Get-CodecStoreAccess
-        if ($Store.StoreAppBlocked) { Add-Result OK 'Microsoft Store' "the Store app is blocked by policy, users cannot reinstall from it ($($Store.Detail))" }
-        else { Add-Result WARN 'Microsoft Store' "users can open the Store and reinstall a removed package ($($Store.Detail)); block it with 'Turn off the Store application' or a packaged-app rule in AppLocker / App Control for Business" }
-    }
-
-    if ($Mode -eq 'Check') {
-        $Present = @($Plan | Where-Object { $_.Present })
-        if ($Present.Count -gt 0) {
-            $Hints.Add("$($Present.Count) of $($Plan.Count) target package(s) still present. Remove them:  .\Remove-CodecExtension.ps1 -Mode Remove")
-            if ($Blockers.Count -gt 0) { $Hints.Add("These processes hold a package file and would block the removal for users: $(Format-Blocker $Blockers). Close them, or add -StopBlockingProcesses.") }
-        }
-        else { $Hints.Add('Every target package is gone from this computer.') }
+        else { $Hints.Add("None of the catalog packages is installed or provisioned $(if ($Offline) { 'in this image' } else { 'on this computer' }).") }
     }
     else {
-        # ---- 3. Plan, refuse what cannot be done, confirm
-        $Work = @($Plan | Where-Object { -not $_.AlreadyClean })
-        if ($Work.Count -eq 0) {
-            Add-Result OK 'Already current' 'every target package is removed, deprovisioned and keyed - nothing to change'
-            if (-not $WhatIfPreference) { Write-CodecEvent -Id 1002 -EntryType Information -Message "Remove-CodecExtension: nothing to do for $($Targets -join ', ')" | Out-Null }
+        # ---- 2. Current state (read-only) and the plan
+        $State = Read-CodecState
+        $Plan = @(Get-CodecPlan -Target $Targets -Installed $State.Installed -Provisioned $State.Provisioned -DeprovisionedKey $State.Keys)
+        $Blockers = @()
+        if (-not $Offline) { $Blockers = @(Get-CodecBlockingProcess -InstallLocation @($State.Installed | ForEach-Object { "$($_.InstallLocation)" } | Where-Object { $_ })) }
+        $BlockedNames = @($Blockers | ForEach-Object { ("$($_.Package)" -split '_')[0] } | Select-Object -Unique)
+        foreach ($P in $Plan) {
+            $Facts = New-Object System.Collections.Generic.List[string]
+            foreach ($I in $P.Installed) {
+                $Facts.Add("installed $($I.Version) for $(Get-CodecUserList $I)")
+                if ((Get-CodecFamilyName "$($I.PackageFullName)") -ne $P.FamilyName) { Add-Result WARN "$($P.Name) publisher" "$($I.PackageFullName) is not signed by the Microsoft Store publisher ID; it was sideloaded" }
+            }
+            foreach ($V in $P.Provisioned) { $Facts.Add("provisioned $($V.Version) (every new user profile gets it)") }
+            if ($P.KeyPresent) { $Facts.Add('Deprovisioned key present') } else { $Facts.Add('no Deprovisioned key') }
+            $Mine = @($Blockers | Where-Object { "$($_.Package)" -like "$($P.Name)_*" })
+            if ($Mine.Count -gt 0) { $Facts.Add('IN USE by ' + ((@($Mine | ForEach-Object { "$($_.ProcessName) (PID $($_.Id)) $($_.Module)" }) | Select-Object -Unique) -join ', ')) }
+            $Line = ($Facts.ToArray() -join '; ')
+            if ($P.AlreadyClean) { Add-Result OK $P.Name 'not installed, not provisioned, Deprovisioned key present - nothing to do' }
+            elseif ($P.Present) { if ($Mode -eq 'Check') { Add-Result FAIL $P.Name "PRESENT - $Line" } else { Add-Result OK "$($P.Name) before" $Line } }
+            else { Add-Result WARN $P.Name "not installed and not provisioned, but $Line - a feature update may provision it again; -Mode Remove writes the key" }
+        }
+        if (-not $Offline) {
+            $Store = Get-CodecStoreAccess
+            if ($Store.StoreAppBlocked) { Add-Result OK 'Microsoft Store' "the Store app is blocked by policy, users cannot reinstall from it ($($Store.Detail))" }
+            else { Add-Result WARN 'Microsoft Store' "users can open the Store and reinstall a removed package ($($Store.Detail)); block it with 'Turn off the Store application' or a packaged-app rule in AppLocker / App Control for Business" }
+        }
+
+        if ($Mode -eq 'Check') {
+            $Present = @($Plan | Where-Object { $_.Present })
+            if ($Present.Count -gt 0) {
+                $Hints.Add("$($Present.Count) of $($Plan.Count) target package(s) still present. Remove them:  $CommandName -Mode Remove$(Get-CodecRerunArgument @($Present | ForEach-Object { $_.Name }))")
+                if ($Blockers.Count -gt 0) { $Hints.Add("These processes hold a package file and would block the removal for users: $(Format-Blocker $Blockers). Close them, or add -StopBlockingProcesses.") }
+            }
+            else { $Hints.Add('Every target package is gone from this computer.') }
         }
         else {
-            $Refused = @($Blockers | Where-Object { (Get-CodecBlockerAction $_.ProcessName) -eq 'refuse' })
-            if ($StopBlockingProcesses -and $Refused.Count -gt 0) { throw "STOP: a process that must not be killed has a package file loaded: $(Format-Blocker $Refused). Stop the owning service, sign the users out, or run the removal in audit mode / at startup, then retry. Nothing was changed." }
-            $Detail = New-Object System.Collections.Generic.List[string]
-            $Detail.Add("Computer: $env:COMPUTERNAME$(if ($Offline) { ' - mounted image ' + $Image.Path })")
-            foreach ($W in $Work) { foreach ($A in $W.Actions) { $Detail.Add("$($W.Name): $A") } }
-            if ($Blockers.Count -gt 0) {
-                if ($StopBlockingProcesses) { $Detail.Add("STOP these processes first, they have a package file loaded: $(Format-Blocker $Blockers)$(if (@($Blockers | Where-Object { $_.ProcessName -ieq 'explorer' }).Count -gt 0) { ' (Explorer is started again afterwards)' })") }
-                else { $Detail.Add("NOT removed for users this run (in use, no -StopBlockingProcesses): $($BlockedNames -join ', ') - held by $(Format-Blocker $Blockers)") }
+            # ---- 3. Plan, refuse what cannot be done, confirm
+            $Work = @($Plan | Where-Object { -not $_.AlreadyClean })
+            if ($Work.Count -eq 0) {
+                Add-Result OK 'Already current' 'every target package is removed, deprovisioned and keyed - nothing to change'
+                if (-not $WhatIfPreference) { Write-CodecEvent -Id 1002 -EntryType Information -Message "Remove-CodecExtension: nothing to do for $($Targets -join ', ')" | Out-Null }
             }
-            $Detail.Add('Effect: Photos, Paint, Explorer thumbnails, Media Player, Edge and WebView2 apps can no longer decode these formats on this computer. Browsers keep their own WebP decoder; Teams/Zoom calls, JPEG/PNG/H.264 are not affected.')
-            $Detail.Add('Undo: reinstall from the Microsoft Store (' + ((@($Work | ForEach-Object { $E = Get-CodecCatalogEntry $_.Name; "$($E.DisplayName) $($E.StoreId)".Trim() })) -join '; ') + ') and delete the Deprovisioned key to let setup provision it again.')
-            if (-not $WhatIfPreference) {
-                Confirm-Change -NoConfirm:$NoConfirm -Action "REMOVE $($Work.Count) codec package(s) on $env:COMPUTERNAME$(if ($Offline) { ' (mounted image)' })" -Detail $Detail.ToArray()
-                $ConfirmPreference = 'None'
-            }
-            else { Write-Host ''; Write-Host "WhatIf - the plan for $($env:COMPUTERNAME):" -ForegroundColor Yellow; foreach ($D in $Detail) { Write-Host "  $D" -ForegroundColor Yellow } }
+            else {
+                $Refused = @($Blockers | Where-Object { (Get-CodecBlockerAction $_.ProcessName) -eq 'refuse' })
+                if ($StopBlockingProcesses -and $Refused.Count -gt 0) { throw "STOP: a process that must not be killed has a package file loaded: $(Format-Blocker $Refused). Stop the owning service, sign the users out, or run the removal in audit mode / at startup, then retry. Nothing was changed." }
+                $Detail = New-Object System.Collections.Generic.List[string]
+                $Detail.Add("Computer: $env:COMPUTERNAME$(if ($Offline) { ' - mounted image ' + $Image.Path })")
+                foreach ($W in $Work) { foreach ($A in $W.Actions) { $Detail.Add("$($W.Name): $A") } }
+                if ($Blockers.Count -gt 0) {
+                    if ($StopBlockingProcesses) { $Detail.Add("STOP these processes first, they have a package file loaded: $(Format-Blocker $Blockers)$(if (@($Blockers | Where-Object { $_.ProcessName -ieq 'explorer' }).Count -gt 0) { ' (Explorer is started again afterwards)' })") }
+                    else { $Detail.Add("NOT removed for users this run (in use, no -StopBlockingProcesses): $($BlockedNames -join ', ') - held by $(Format-Blocker $Blockers)") }
+                }
+                $Detail.Add('Effect: Photos, Paint, Explorer thumbnails, Media Player, Edge and WebView2 apps can no longer decode these formats on this computer. Browsers keep their own WebP decoder; Teams/Zoom calls, JPEG/PNG/H.264 are not affected.')
+                $Detail.Add('Undo: reinstall from the Microsoft Store (' + ((@($Work | ForEach-Object { $E = Get-CodecCatalogEntry $_.Name; "$($E.DisplayName) $($E.StoreId)".Trim() })) -join '; ') + ') and delete the Deprovisioned key to let setup provision it again.')
+                if (-not $WhatIfPreference) {
+                    Confirm-Change -NoConfirm:$NoConfirm -Action "REMOVE $($Work.Count) codec package(s) on $env:COMPUTERNAME$(if ($Offline) { ' (mounted image)' })" -Detail $Detail.ToArray()
+                    $ConfirmPreference = 'None'
+                }
+                else { Write-Host ''; Write-Host "WhatIf - the plan for $($env:COMPUTERNAME):" -ForegroundColor Yellow; foreach ($D in $Detail) { Write-Host "  $D" -ForegroundColor Yellow } }
 
-            # ---- 4. Evidence before, then apply
-            $Before = Write-CodecInventory -Suffix 'before' -PlanRows $Plan -BlockerRows $Blockers
-            Add-Result OK 'Inventory before' $Before
-            if (-not $WhatIfPreference) { Write-CodecEvent -Id 1000 -EntryType Information -Message "Remove-CodecExtension: removal started by $RunAs for $(($Work | ForEach-Object { $_.Name }) -join ', ')$(if ($Offline) { ' in mounted image ' + $Image.Path })" | Out-Null }
-            if (-not $Offline -and $StopBlockingProcesses -and $Blockers.Count -gt 0 -and -not $WhatIfPreference) {
-                Stop-CodecBlocker $Blockers
-                $Blockers = @(Get-CodecBlockingProcess -InstallLocation @($State.Installed | ForEach-Object { "$($_.InstallLocation)" } | Where-Object { $_ }))
-                $BlockedNames = @($Blockers | ForEach-Object { ("$($_.Package)" -split '_')[0] } | Select-Object -Unique)
-                if ($Blockers.Count -gt 0) { Add-Result WARN 'Still in use' "after stopping: $(Format-Blocker $Blockers) - the removal is retried per package" }
-            }
-            $Failed = New-Object System.Collections.Generic.List[string]
-            foreach ($W in $Work) {
-                $Check = $W.Name
-                # 4a. every user profile (online only)
-                foreach ($I in $W.Installed) {
-                    $Full = "$($I.PackageFullName)"
-                    if (-not $StopBlockingProcesses -and ($BlockedNames -contains $W.Name)) {
-                        $Held = Format-Blocker @($Blockers | Where-Object { "$($_.Package)" -eq $Full })
-                        Add-Result FAIL "$Check users" "NOT removed: $Full is in use by $Held. Close those apps (or sign the users out) and run again, or add -StopBlockingProcesses."
-                        if (-not $WhatIfPreference) { Write-CodecEvent -Id 2001 -EntryType Warning -Message "Remove-CodecExtension: $Full not removed, in use by $Held" | Out-Null }
-                        $Failed.Add($W.Name)
-                        continue
-                    }
-                    if (-not $PSCmdlet.ShouldProcess($Full, 'Remove package for every user')) { Add-Result OK "$Check users" "WhatIf: would remove $Full for every user"; continue }
-                    $Done = $false; $Why = $null
-                    for ($Try = 1; $Try -le 3 -and -not $Done; $Try++) {
-                        try { Remove-AppxPackage -Package $Full -AllUsers -ErrorAction Stop; $Done = $true }
-                        catch {
-                            $Why = ConvertTo-CodecHresultText "$($_.Exception.Message)"
-                            if ($Why.Code -eq '0x80073CF1') { $Done = $true; break }
-                            if ($Why.Code -eq '0x80073D02' -and $StopBlockingProcesses -and $Try -lt 3) {
-                                $Again = @(Get-CodecBlockingProcess -InstallLocation @("$($I.InstallLocation)"))
-                                Add-Result WARN "$Check users" "try $Try - still in use by $(Format-Blocker $Again); stopping and retrying"
-                                if ($Again.Count -gt 0) { Stop-CodecBlocker $Again } else { Start-Sleep -Seconds 3 }
-                                continue
+                # ---- 4. Evidence before, then apply
+                $Before = Write-CodecInventory -Suffix 'before' -PlanRows $Plan -BlockerRows $Blockers
+                Add-Result OK 'Inventory before' $Before
+                if (-not $WhatIfPreference) { Write-CodecEvent -Id 1000 -EntryType Information -Message "Remove-CodecExtension: removal started by $RunAs for $(($Work | ForEach-Object { $_.Name }) -join ', ')$(if ($Offline) { ' in mounted image ' + $Image.Path })" | Out-Null }
+                if (-not $Offline -and $StopBlockingProcesses -and $Blockers.Count -gt 0 -and -not $WhatIfPreference) {
+                    Stop-CodecBlocker $Blockers
+                    $Blockers = @(Get-CodecBlockingProcess -InstallLocation @($State.Installed | ForEach-Object { "$($_.InstallLocation)" } | Where-Object { $_ }))
+                    $BlockedNames = @($Blockers | ForEach-Object { ("$($_.Package)" -split '_')[0] } | Select-Object -Unique)
+                    if ($Blockers.Count -gt 0) { Add-Result WARN 'Still in use' "after stopping: $(Format-Blocker $Blockers) - the removal is retried per package" }
+                }
+                $Failed = New-Object System.Collections.Generic.List[string]
+                foreach ($W in $Work) {
+                    $Check = $W.Name
+                    # 4a. every user profile (online only)
+                    foreach ($I in $W.Installed) {
+                        $Full = "$($I.PackageFullName)"
+                        if (-not $StopBlockingProcesses -and ($BlockedNames -contains $W.Name)) {
+                            $Held = Format-Blocker @($Blockers | Where-Object { "$($_.Package)" -eq $Full })
+                            Add-Result FAIL "$Check users" "NOT removed: $Full is in use by $Held. Close those apps (or sign the users out) and run again, or add -StopBlockingProcesses."
+                            if (-not $WhatIfPreference) { Write-CodecEvent -Id 2001 -EntryType Warning -Message "Remove-CodecExtension: $Full not removed, in use by $Held" | Out-Null }
+                            $Failed.Add($W.Name)
+                            $FailKind[$W.Name] = 'inuse'
+                            continue
+                        }
+                        if (-not $PSCmdlet.ShouldProcess($Full, 'Remove package for every user')) { Add-Result OK "$Check users" "WhatIf: would remove $Full for every user"; continue }
+                        $Done = $false; $Why = $null
+                        $CallStart = (Get-Date).AddSeconds(-2)
+                        for ($Try = 1; $Try -le 3 -and -not $Done; $Try++) {
+                            try { Remove-AppxPackage -Package $Full -AllUsers -ErrorAction Stop; $Done = $true }
+                            catch {
+                                $Why = Get-CodecFailure -ErrorRecord $_ -PackageName $Full -Since $CallStart
+                                if ($Why.Code -eq '0x80073CF1') { $Done = $true; break }
+                                if ($Why.Code -eq '0x80073D02' -and $StopBlockingProcesses -and $Try -lt 3) {
+                                    $Again = @(Get-CodecBlockingProcess -InstallLocation @("$($I.InstallLocation)"))
+                                    Add-Result WARN "$Check users" "try $Try - still in use by $(Format-Blocker $Again); stopping and retrying"
+                                    if ($Again.Count -gt 0) { Stop-CodecBlocker $Again } else { Start-Sleep -Seconds 3 }
+                                    continue
+                                }
+                                break
                             }
-                            break
+                        }
+                        if ($Done -and $null -ne $Why -and $Why.Code -eq '0x80073CF1') { Add-Result WARN "$Check users" "$Full was already gone ($($Why.Text))" }
+                        elseif ($Done) { Add-Result OK "$Check users" "removed $Full for every user" }
+                        else {
+                            Add-Result FAIL "$Check users" "Remove-AppxPackage $Full failed: $($Why.Text)$($Why.LogNote)"
+                            Write-CodecEvent -Id 3001 -EntryType Error -Message "Remove-CodecExtension: Remove-AppxPackage $Full failed: $($Why.Text)$($Why.LogNote)" | Out-Null
+                            $Failed.Add($W.Name)
+                            $FailKind[$W.Name] = $Why.Kind
                         }
                     }
-                    if ($Done -and $null -ne $Why -and $Why.Code -eq '0x80073CF1') { Add-Result WARN "$Check users" "$Full was already gone ($($Why.Text))" }
-                    elseif ($Done) { Add-Result OK "$Check users" "removed $Full for every user" }
-                    else {
-                        Add-Result FAIL "$Check users" "Remove-AppxPackage $Full failed: $($Why.Text)"
-                        Write-CodecEvent -Id 3001 -EntryType Error -Message "Remove-CodecExtension: Remove-AppxPackage $Full failed: $($Why.Text)" | Out-Null
-                        $Failed.Add($W.Name)
+                    # 4b. provisioning
+                    foreach ($V in $W.Provisioned) {
+                        $ProvName = "$($V.PackageName)"
+                        if (-not $PSCmdlet.ShouldProcess($ProvName, 'Remove provisioned package')) { Add-Result OK "$Check provisioning" "WhatIf: would deprovision $ProvName"; continue }
+                        $CallStart = (Get-Date).AddSeconds(-2)
+                        try {
+                            if ($Offline) { Remove-AppxProvisionedPackage -Path $Image.Path -PackageName $ProvName -ErrorAction Stop | Out-Null }
+                            else { Remove-AppxProvisionedPackage -Online -PackageName $ProvName -ErrorAction Stop | Out-Null }
+                            Add-Result OK "$Check provisioning" "deprovisioned $ProvName"
+                        }
+                        catch {
+                            $Why = Get-CodecFailure -ErrorRecord $_ -PackageName $ProvName -Since $CallStart
+                            Add-Result FAIL "$Check provisioning" "Remove-AppxProvisionedPackage $ProvName failed: $($Why.Text)$($Why.LogNote)"
+                            Write-CodecEvent -Id 3001 -EntryType Error -Message "Remove-CodecExtension: Remove-AppxProvisionedPackage $ProvName failed: $($Why.Text)$($Why.LogNote)" | Out-Null
+                            $Failed.Add($W.Name)
+                            if (-not $FailKind.ContainsKey($W.Name)) { $FailKind[$W.Name] = $Why.Kind }
+                        }
+                    }
+                    # 4c. Deprovisioned key (online; offline keys are written in one hive session below)
+                    if (-not $W.KeyPresent -and -not $Offline) {
+                        $KeyResult = Set-CodecDeprovisionedKey -Root $DeprovisionedKeyRoot -FamilyName $W.FamilyName
+                        switch ($KeyResult) {
+                            'created' { Add-Result OK "$Check key" "created $DeprovisionedKeyRoot\$($W.FamilyName)" }
+                            'present' { Add-Result OK "$Check key" "already present $DeprovisionedKeyRoot\$($W.FamilyName)" }
+                            default { Add-Result OK "$Check key" "WhatIf: would create $DeprovisionedKeyRoot\$($W.FamilyName)" }
+                        }
                     }
                 }
-                # 4b. provisioning
-                foreach ($V in $W.Provisioned) {
-                    $ProvName = "$($V.PackageName)"
-                    if (-not $PSCmdlet.ShouldProcess($ProvName, 'Remove provisioned package')) { Add-Result OK "$Check provisioning" "WhatIf: would deprovision $ProvName"; continue }
-                    try {
-                        if ($Offline) { Remove-AppxProvisionedPackage -Path $Image.Path -PackageName $ProvName -ErrorAction Stop | Out-Null }
-                        else { Remove-AppxProvisionedPackage -Online -PackageName $ProvName -ErrorAction Stop | Out-Null }
-                        Add-Result OK "$Check provisioning" "deprovisioned $ProvName"
-                    }
-                    catch {
-                        $Why = ConvertTo-CodecHresultText "$($_.Exception.Message)"
-                        Add-Result FAIL "$Check provisioning" "Remove-AppxProvisionedPackage $ProvName failed: $($Why.Text)"
-                        Write-CodecEvent -Id 3001 -EntryType Error -Message "Remove-CodecExtension: Remove-AppxProvisionedPackage $ProvName failed: $($Why.Text)" | Out-Null
-                        $Failed.Add($W.Name)
+                if ($Offline) {
+                    $KeyWork = @($Work | Where-Object { -not $_.KeyPresent })
+                    if ($KeyWork.Count -gt 0) {
+                        if ($PSCmdlet.ShouldProcess($Image.HivePath, "Write $($KeyWork.Count) Deprovisioned key(s) into the image hive")) {
+                            $Written = @(Use-CodecOfflineHive -HivePath $Image.HivePath -Script {
+                                param($HiveRoot)
+                                $K = Join-Path $HiveRoot $DeprovisionedRelative
+                                foreach ($W in $KeyWork) { "$($W.FamilyName)=$(Set-CodecDeprovisionedKey -Root $K -FamilyName $W.FamilyName)" }
+                            })
+                            foreach ($Line in $Written) { Add-Result OK 'Deprovisioned key (image)' "$Line" }
+                        }
+                        else { foreach ($W in $KeyWork) { Add-Result OK "$($W.Name) key" "WhatIf: would create $($W.FamilyName) in the image hive" } }
                     }
                 }
-                # 4c. Deprovisioned key (online; offline keys are written in one hive session below)
-                if (-not $W.KeyPresent -and -not $Offline) {
-                    $KeyResult = Set-CodecDeprovisionedKey -Root $DeprovisionedKeyRoot -FamilyName $W.FamilyName
-                    switch ($KeyResult) {
-                        'created' { Add-Result OK "$Check key" "created $DeprovisionedKeyRoot\$($W.FamilyName)" }
-                        'present' { Add-Result OK "$Check key" "already present $DeprovisionedKeyRoot\$($W.FamilyName)" }
-                        default { Add-Result OK "$Check key" "WhatIf: would create $DeprovisionedKeyRoot\$($W.FamilyName)" }
-                    }
+                if ($ExplorerStopped -and -not $IsSystem -and -not $WhatIfPreference) {
+                    Start-Process -FilePath (Join-Path $env:SystemRoot 'explorer.exe') | Out-Null
+                    Add-Result OK 'Explorer' 'started again'
                 }
-            }
-            if ($Offline) {
-                $KeyWork = @($Work | Where-Object { -not $_.KeyPresent })
-                if ($KeyWork.Count -gt 0) {
-                    if ($PSCmdlet.ShouldProcess($Image.HivePath, "Write $($KeyWork.Count) Deprovisioned key(s) into the image hive")) {
-                        $Written = @(Use-CodecOfflineHive -HivePath $Image.HivePath -Script {
-                            param($HiveRoot)
-                            $K = Join-Path $HiveRoot $DeprovisionedRelative
-                            foreach ($W in $KeyWork) { "$($W.FamilyName)=$(Set-CodecDeprovisionedKey -Root $K -FamilyName $W.FamilyName)" }
-                        })
-                        foreach ($Line in $Written) { Add-Result OK 'Deprovisioned key (image)' "$Line" }
-                    }
-                    else { foreach ($W in $KeyWork) { Add-Result OK "$($W.Name) key" "WhatIf: would create $($W.FamilyName) in the image hive" } }
-                }
-            }
-            if ($ExplorerStopped -and -not $IsSystem -and -not $WhatIfPreference) {
-                Start-Process -FilePath (Join-Path $env:SystemRoot 'explorer.exe') | Out-Null
-                Add-Result OK 'Explorer' 'started again'
-            }
-            elseif ($ExplorerStopped) { Add-Result WARN 'Explorer' 'was stopped and not started again (LocalSystem session); the user can start it from Task Manager or sign in again' }
+                elseif ($ExplorerStopped) { Add-Result WARN 'Explorer' 'was stopped and not started again (LocalSystem session); the user can start it from Task Manager or sign in again' }
 
-            # ---- 5. Verify from the system
-            if (-not $WhatIfPreference) {
-                $After = Read-CodecState
-                $PlanAfter = @(Get-CodecPlan -Target @($Work | ForEach-Object { $_.Name }) -Installed $After.Installed -Provisioned $After.Provisioned -DeprovisionedKey $After.Keys)
-                foreach ($P in $PlanAfter) {
-                    $Left = New-Object System.Collections.Generic.List[string]
-                    foreach ($I in $P.Installed) { $Left.Add("still registered: $($I.PackageFullName) for $(Get-CodecUserList $I)") }
-                    foreach ($V in $P.Provisioned) { $Left.Add("still provisioned: $($V.PackageName)") }
-                    if (-not $P.KeyPresent) { $Left.Add("key missing: $($P.FamilyName)") }
-                    if ($Left.Count -eq 0) {
-                        Add-Result OK "$($P.Name) verified" 'not registered to any user, not provisioned, Deprovisioned key present'
-                        Write-CodecEvent -Id 1001 -EntryType Information -Message "Remove-CodecExtension: $($P.Name) removed for every user, deprovisioned and keyed on $env:COMPUTERNAME$(if ($Offline) { ' (mounted image ' + $Image.Path + ')' })" | Out-Null
+                # ---- 5. Verify from the system
+                if (-not $WhatIfPreference) {
+                    $After = Read-CodecState
+                    $PlanAfter = @(Get-CodecPlan -Target @($Work | ForEach-Object { $_.Name }) -Installed $After.Installed -Provisioned $After.Provisioned -DeprovisionedKey $After.Keys)
+                    foreach ($P in $PlanAfter) {
+                        $Left = New-Object System.Collections.Generic.List[string]
+                        foreach ($I in $P.Installed) { $Left.Add("still registered: $($I.PackageFullName) for $(Get-CodecUserList $I)") }
+                        foreach ($V in $P.Provisioned) { $Left.Add("still provisioned: $($V.PackageName)") }
+                        if (-not $P.KeyPresent) { $Left.Add("key missing: $($P.FamilyName)") }
+                        if ($Left.Count -eq 0) {
+                            Add-Result OK "$($P.Name) verified" 'not registered to any user, not provisioned, Deprovisioned key present'
+                            Write-CodecEvent -Id 1001 -EntryType Information -Message "Remove-CodecExtension: $($P.Name) removed for every user, deprovisioned and keyed on $env:COMPUTERNAME$(if ($Offline) { ' (mounted image ' + $Image.Path + ')' })" | Out-Null
+                        }
+                        elseif ($Failed -contains $P.Name) { Add-Result WARN "$($P.Name) verified" ($Left.ToArray() -join '; ') }
+                        else {
+                            Add-Result FAIL "$($P.Name) verified" ($Left.ToArray() -join '; ')
+                            Write-CodecEvent -Id 3001 -EntryType Error -Message "Remove-CodecExtension: $($P.Name) verification failed on $env:COMPUTERNAME - $($Left.ToArray() -join '; ')" | Out-Null
+                        }
                     }
-                    elseif ($Failed -contains $P.Name) { Add-Result WARN "$($P.Name) verified" ($Left.ToArray() -join '; ') }
-                    else {
-                        Add-Result FAIL "$($P.Name) verified" ($Left.ToArray() -join '; ')
-                        Write-CodecEvent -Id 3001 -EntryType Error -Message "Remove-CodecExtension: $($P.Name) verification failed on $env:COMPUTERNAME - $($Left.ToArray() -join '; ')" | Out-Null
+                    $AfterFile = Write-CodecInventory -Suffix 'after' -PlanRows $PlanAfter -BlockerRows @()
+                    Add-Result OK 'Inventory after' $AfterFile
+                    if ($Failed.Count -gt 0) {
+                        $Unfinished = @($Failed | Select-Object -Unique)
+                        $Hints.Add("Not finished for: $($Unfinished -join ', '). Deal with the cause below, then run the same command again; it only does what is still missing.")
+                        $InUseNames = @($Unfinished | Where-Object { $FailKind[$_] -eq 'inuse' })
+                        $DeniedNames = @($Unfinished | Where-Object { $FailKind[$_] -eq 'denied' })
+                        $OtherNames = @($Unfinished | Where-Object { $FailKind[$_] -ne 'inuse' -and $FailKind[$_] -ne 'denied' })
+                        if ($InUseNames.Count -gt 0) { $Hints.Add("In use ($($InUseNames -join ', ')): close the apps named in the rows above or sign the users out, or add -StopBlockingProcesses.") }
+                        if ($DeniedNames.Count -gt 0) { $Hints.Add("Access denied ($($DeniedNames -join ', ')): 0x80070005 came from Windows' app deployment service, not from this session (it is elevated). Nothing needs closing; run the command again now. On build 28000 the rerun removed what the first run could not.") }
+                        if ($OtherNames.Count -gt 0) { $Hints.Add("Other errors ($($OtherNames -join ', ')): see the FAIL rows above.") }
+                        if ($ActivityIds.Count -gt 0) { $Hints.Add("Windows' own log of the failed step:  Get-AppPackageLog -ActivityID $(@($ActivityIds | Select-Object -Unique) -join ', ')  (Event Viewer: Microsoft-Windows-AppXDeploymentServer/Operational)") }
+                        $Hints.Add("Run again:  $CommandName -Mode Remove$(Get-CodecRerunArgument $Unfinished)$(if ($StopBlockingProcesses) { ' -StopBlockingProcesses' })")
                     }
+                    else { $Hints.Add("Done. No reboot is needed. Confirm any time with:  $CommandName -Mode Check$(Get-CodecRerunArgument @())") }
                 }
-                $AfterFile = Write-CodecInventory -Suffix 'after' -PlanRows $PlanAfter -BlockerRows @()
-                Add-Result OK 'Inventory after' $AfterFile
-                if ($Failed.Count -gt 0) { $Hints.Add("Not finished for: $(@($Failed | Select-Object -Unique) -join ', '). Close the apps that hold the files (see the rows above), then run the same command again; it only does what is still missing.") }
-                else { $Hints.Add('Done. No reboot is needed. Confirm any time with:  .\Remove-CodecExtension.ps1 -Mode Check') }
+                else { $Hints.Add('WhatIf: nothing was changed. Run without -WhatIf to perform the removal.') }
             }
-            else { $Hints.Add('WhatIf: nothing was changed. Run without -WhatIf to perform the removal.') }
         }
     }
 }

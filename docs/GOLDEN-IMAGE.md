@@ -32,6 +32,7 @@ Nothing holds the package files in audit mode (no browser, no Store session), so
 Get-WindowsImage -ImagePath D:\Images\install.wim                  # find the index (Enterprise is often 3)
 New-Item -Path C:\Mount -ItemType Directory -Force | Out-Null
 Mount-WindowsImage -ImagePath D:\Images\install.wim -Index 3 -Path C:\Mount
+.\Remove-CodecExtension.ps1 -ListPackages -MountedImagePath C:\Mount   # every codec package the image provisions
 .\Remove-CodecExtension.ps1 -Mode Check  -MountedImagePath C:\Mount
 .\Remove-CodecExtension.ps1 -Mode Remove -MountedImagePath C:\Mount -NoConfirm
 Dismount-WindowsImage -Path C:\Mount -Save
@@ -71,7 +72,10 @@ Detection (exit code 0 = compliant, 1 = a package is still present):
 - **Logon-time or maintenance-window runs on a user's computer**: add `-StopBlockingProcesses` if the HEVC package
   must go while Edge or WebView2 apps are open; it closes them (Explorer is restarted). Announce it.
 - **Monitoring**: Application log, source `CodecExtensionRemoval`: 1001 per package removed and verified, 1002
-  nothing to do, 2001 package in use, 3000 run stopped, 3001 a removal failed.
+  nothing to do, 2001 package in use, 3000 run stopped, 3001 a removal failed. A 3001 with `0x80070005` names the
+  AppX activity ID; running the command again finished the package when this was seen (see E).
+- **What else is on a computer**: `-ListPackages` lists every codec package the script can handle, its state, and
+  the exact names to pass to `-Package`, and writes the list as CSV next to the inventory files.
 
 `psexec -s` or any other way to run as SYSTEM is not required for the removal; an elevated administrator has every
 right it needs, and SYSTEM does not release a DLL another process holds.
@@ -106,3 +110,9 @@ right it needs, and SYSTEM does not release a DLL another process holds.
   them "already present".
 - Afterwards `-Mode Check` reported every package "not installed, not provisioned, Deprovisioned key present" and a
   second `-Mode Remove` reported "Already current" without prompting. No reboot was needed.
+- HEIF on 2026-10-27, run interactively by the signed-in domain administrator: Windows removed the package for the
+  local account, then returned access denied (0x80070005, "Failure in the OptionalDependenciesHandled state
+  handler") for the signed-in account in the same request; the script's own deprovisioning and key step succeeded.
+  The same command limited to HEIF finished it a few minutes later. An unattended run that hits this exits 1, and
+  the next run is expected to complete the package the same way; that was seen interactively, not yet in a
+  System-context deployment.

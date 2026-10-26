@@ -13,17 +13,20 @@
     Functions:
       Get-CodecCatalogEntry        what a package is, where it comes from, what stops working without it, Store ID
       Get-CodecFamilyName          package family name (Name_PublisherId) from a full or a provisioned package name
-      ConvertTo-CodecHresultText   the Appx deployment HRESULT inside a removal error, in words
+      ConvertTo-CodecHresultText   the Appx deployment HRESULT of a removal error (message or exception), in words
       Get-CodecUserList            the user accounts a package is registered to, as one string
       Get-CodecBlockingProcess     processes that have a file of the package loaded (the "in use" cause)
       Get-CodecBlockerAction       stop / restart / refuse for a blocking process name
       Get-CodecPlan                per package: installed, provisioned, key present, and the actions still needed
+      Get-CodecPackageListing      every catalog package with its state, for -ListPackages
+      Get-CodecModuleOrigin        'native' or 'Windows PowerShell compatibility' for a loaded module
       Test-CodecOfflineImage       a mounted image folder: SOFTWARE hive present, kernel build, not the running OS
       Set-CodecDeprovisionedKey    creates the Deprovisioned key for a package family (idempotent, -WhatIf aware)
       Test-CodecDeprovisionedKey   is the key there
       Invoke-CodecNative           runs a native executable with an argument array and returns exit code + output
       Use-CodecOfflineHive         loads an offline SOFTWARE hive, runs a script block against it, unloads it
       Initialize-CodecModules      Appx and Dism, natively or through the Windows PowerShell compatibility layer
+      Find-CodecDeploymentError    the AppX deployment log entry (activity ID, failing step) behind a removal error
       Test-CodecElevated           is this an elevated session
       Test-CodecSystemAccount      is this running as NT AUTHORITY\SYSTEM
       Get-CodecOsInfo              caption, build, display version, edition, product type
@@ -128,7 +131,7 @@ $CodecHresultText = @{
     '0x80073D01' = 'ERROR_DEPLOYMENT_BLOCKED_BY_POLICY - a policy blocks app deployment on this computer'
     '0x80073D1A' = 'ERROR_DEPLOYMENT_BLOCKED_BY_USER_LOG_OFF - a user is signing out; retry'
     '0x80070032' = 'ERROR_NOT_SUPPORTED - this app is part of Windows and cannot be removed per user'
-    '0x80070005' = 'E_ACCESSDENIED - the session is not elevated or the package is protected'
+    '0x80070005' = 'E_ACCESSDENIED - the app deployment service refused this step (the script already checked that the session is elevated); run the same command again, it finishes what is left'
 }
 
 # Processes that must never be killed to free a package file. Explorer is restarted instead (see Get-CodecBlockerAction).
@@ -174,18 +177,30 @@ function Get-CodecFamilyName {
 function ConvertTo-CodecHresultText {
     <#
     .SYNOPSIS
-        Finds the 0x8007xxxx / 0x8007 3Dxx HRESULT in an Appx error message and explains it.
+        Finds the 0x8007xxxx / 0x8007 3Dxx HRESULT of an Appx error and explains it.
+    .DESCRIPTION
+        The code is taken from the message when it contains one ("Deployment failed with HRESULT: 0x80073D02 ...").
+        Otherwise the exception's own HResult is used, but only when it is a Win32 code (0x8007xxxx) or a catalogued
+        one: PowerShell 7 reports an access-denied removal as just "Access is denied." with HResult 0x80070005,
+        while generic exceptions carry 0x80131500, which says nothing.
     .PARAMETER Message
         The exception message from Remove-AppxPackage or Remove-AppxProvisionedPackage.
+    .PARAMETER HResult
+        The exception's HResult ($_.Exception.HResult). 0 (default) = unknown.
     .OUTPUTS
         PSCustomObject with Code (e.g. 0x80073D02 or ''), Text (the explanation, or the original message)
     #>
-    param([string]$Message)
-    $Text = "$Message" -replace '\s+', ' '
+    param([string]$Message, [int]$HResult = 0)
+    $Text = ("$Message" -replace '\s+', ' ').Trim()
     $Code = ''
     if ($Text -match '0x[0-9A-Fa-f]{8}') { $Code = $Matches[0].ToUpperInvariant().Replace('0X', '0x') }
+    elseif ($HResult -ne 0) {
+        $FromException = '0x' + $HResult.ToString('X8', [Globalization.CultureInfo]::InvariantCulture)
+        if ($FromException -like '0x8007*' -or $CodecHresultText.ContainsKey($FromException)) { $Code = $FromException }
+    }
     if ($Code -and $CodecHresultText.ContainsKey($Code)) { return [pscustomobject]@{ Code = $Code; Text = "$Code $($CodecHresultText[$Code])" } }
-    return [pscustomobject]@{ Code = $Code; Text = $Text.Trim() }
+    if ($Code -and $Text -notmatch [regex]::Escape($Code)) { return [pscustomobject]@{ Code = $Code; Text = "$Code $Text" } }
+    return [pscustomobject]@{ Code = $Code; Text = $Text }
 }
 
 function Get-CodecUserList {
@@ -314,6 +329,48 @@ function Get-CodecPlan {
     return $Plan.ToArray()   # not @($Plan): wrapping a List[object] of custom objects throws 'Argument types do not match' on some builds
 }
 
+function Get-CodecPackageListing {
+    <#
+    .SYNOPSIS
+        Every package in the catalog with its state on this computer (or in a mounted image), the exact name to pass
+        to -Package, and whether it is a default target. Pure: takes the inventories as parameters.
+    .PARAMETER Installed
+        Objects from Get-AppxPackage -AllUsers (any package; filtered by Name).
+    .PARAMETER Provisioned
+        Objects from Get-AppxProvisionedPackage (any package; filtered by DisplayName).
+    .PARAMETER DeprovisionedKey
+        Names of the subkeys under AppxAllUserStore\Deprovisioned (package family names).
+    .PARAMETER Offline
+        The inventories come from a mounted image (no user registrations there).
+    .OUTPUTS
+        PSCustomObject per catalog entry, in catalog order: Package, DisplayName, StoreId, DefaultTarget, Present,
+        State, Installed, Provisioned, KeyPresent, Decodes, Breaks. Wrap the call in @().
+    #>
+    param([object[]]$Installed = @(), [object[]]$Provisioned = @(), [string[]]$DeprovisionedKey = @(), [switch]$Offline)
+    $Names = @($CodecCatalog | ForEach-Object { $_.Name })
+    $Plan = @(Get-CodecPlan -Target $Names -Installed $Installed -Provisioned $Provisioned -DeprovisionedKey $DeprovisionedKey)
+    $Rows = New-Object System.Collections.Generic.List[object]
+    foreach ($P in $Plan) {
+        $Entry = Get-CodecCatalogEntry $P.Name
+        $Inst = @($P.Installed | ForEach-Object { "$($_.Version) for $(Get-CodecUserList $_)" })
+        $Prov = @($P.Provisioned | ForEach-Object { "$($_.Version)" })
+        $Facts = New-Object System.Collections.Generic.List[string]
+        if ($Inst.Count -gt 0) { $Facts.Add("installed $($Inst -join '; ')") }
+        if ($Prov.Count -gt 0) { $Facts.Add("provisioned $($Prov -join ', ')$(if ($Offline) { ' in the image' })") }
+        if ($P.Present) { if ($P.KeyPresent) { $Facts.Add('Deprovisioned key present') } else { $Facts.Add('no Deprovisioned key') } }
+        elseif ($P.KeyPresent) { $Facts.Add('removed: not installed, not provisioned, Deprovisioned key present') }
+        elseif ($Offline) { $Facts.Add('not in the image') }
+        else { $Facts.Add('not on this computer') }
+        $Rows.Add([pscustomobject]@{
+            Package = $P.Name; DisplayName = $Entry.DisplayName; StoreId = $Entry.StoreId
+            DefaultTarget = [bool]($CodecDefaultPackages -contains $P.Name); Present = [bool]$P.Present
+            State = ($Facts.ToArray() -join '; '); Installed = ($Inst -join ' | '); Provisioned = ($Prov -join ', ')
+            KeyPresent = [bool]$P.KeyPresent; Decodes = $Entry.Decodes; Breaks = $Entry.Breaks
+        })
+    }
+    return $Rows.ToArray()
+}
+
 function Test-CodecOfflineImage {
     <#
     .SYNOPSIS
@@ -434,14 +491,41 @@ function Use-CodecOfflineHive {
     return $Result
 }
 
+function Get-CodecModuleOrigin {
+    <#
+    .SYNOPSIS
+        'Windows PowerShell compatibility' when a loaded module is the implicit-remoting proxy that
+        Import-Module -UseWindowsPowerShell creates in PowerShell 7, 'native' for any other module, '' for none.
+    .DESCRIPTION
+        The proxy is a script module under %TEMP%\remoteIpMoProxy_<name>_... whose PrivateData holds an
+        ImplicitRemoting entry. Its functions take precedence over the cmdlets of a native import of the same module,
+        so the module that answers a command is the one to look at (Get-Command <cmd>).Module.
+    .PARAMETER Module
+        A PSModuleInfo, e.g. (Get-Command Get-AppxProvisionedPackage).Module.
+    .OUTPUTS
+        String
+    #>
+    param([object]$Module)
+    if ($null -eq $Module) { return '' }
+    $Private = $null
+    try { $Private = $Module.PrivateData } catch { $Private = $null }
+    if ($Private -is [hashtable] -and $Private.ContainsKey('ImplicitRemoting')) { return 'Windows PowerShell compatibility' }
+    if ("$($Module.ModuleBase)" -match '\\remoteIpMoProxy_') { return 'Windows PowerShell compatibility' }
+    return 'native'
+}
+
 function Initialize-CodecModules {
     <#
     .SYNOPSIS
         Imports Appx and Dism. In PowerShell 7 the Dism module (and on some builds Appx) fails with "Class not
         registered" when loaded natively; the module is then imported through the Windows PowerShell compatibility
-        layer (-UseWindowsPowerShell). Each module is probed with a read-only call before it is accepted.
+        layer (-UseWindowsPowerShell). Each module is probed with a read-only call before it is accepted, and the
+        label comes from the module that answers the probe command (Get-CodecModuleOrigin), not from the import that
+        was attempted: a second run in the same PowerShell 7 window finds the compatibility proxy of the first run
+        still loaded, and that proxy keeps answering even after a native import.
     .OUTPUTS
-        PSCustomObject: Appx, Dism - 'native' or 'Windows PowerShell compatibility'
+        PSCustomObject: Appx, Dism - 'native', 'Windows PowerShell compatibility', or 'Windows PowerShell
+        compatibility (loaded earlier in this session)'
     #>
     # Loading a module is not a change, but a script started with -WhatIf carries the preference into every scope,
     # including the module's own alias creation and the proxy files of the Windows PowerShell compatibility import,
@@ -453,9 +537,22 @@ function Initialize-CodecModules {
     try {
         foreach ($Name in @('Appx', 'Dism')) {
             $Probe = { param($M) try { if ($M -eq 'Appx') { Get-AppxPackage -AllUsers -Name 'Microsoft.Windows.ShellExperienceHost' -ErrorAction Stop | Out-Null } else { Get-AppxProvisionedPackage -Online -ErrorAction Stop | Select-Object -First 1 | Out-Null }; return $true } catch { return $false } }
+            $ProbeCommand = 'Get-AppxProvisionedPackage'
+            if ($Name -eq 'Appx') { $ProbeCommand = 'Get-AppxPackage' }
+            # An earlier run in this PowerShell 7 window left its compatibility proxy loaded: use it as it is.
+            $Loaded = Get-Command -Name $ProbeCommand -ErrorAction SilentlyContinue
+            if ($null -ne $Loaded -and (Get-CodecModuleOrigin $Loaded.Module) -eq 'Windows PowerShell compatibility' -and (& $Probe $Name)) {
+                $How[$Name] = 'Windows PowerShell compatibility (loaded earlier in this session)'
+                continue
+            }
             $Native = $false
             try { Import-Module -Name $Name -ErrorAction Stop -WarningAction SilentlyContinue; $Native = (& $Probe $Name) } catch { $Native = $false }
-            if ($Native) { $How[$Name] = 'native'; continue }
+            if ($Native) {
+                $Origin = Get-CodecModuleOrigin (Get-Command -Name $ProbeCommand -ErrorAction SilentlyContinue).Module
+                if (-not $Origin) { $Origin = 'native' }
+                $How[$Name] = $Origin
+                continue
+            }
             if ($PSVersionTable.PSEdition -ne 'Core') { throw "STOP: the $Name module does not work in this session (probe failed). Run from an elevated Windows PowerShell 5.1 console. Nothing was changed." }
             Remove-Module -Name $Name -Force -ErrorAction SilentlyContinue
             try { Import-Module -Name $Name -UseWindowsPowerShell -ErrorAction Stop -WarningAction SilentlyContinue } catch { throw "STOP: the $Name module could not be loaded natively or through Windows PowerShell compatibility: $($_.Exception.Message). Run from an elevated Windows PowerShell 5.1 console. Nothing was changed." }
@@ -465,6 +562,40 @@ function Initialize-CodecModules {
     }
     finally { $Global:WhatIfPreference = $GlobalWhatIf }
     return [pscustomobject]$How
+}
+
+function Find-CodecDeploymentError {
+    <#
+    .SYNOPSIS
+        Read-only: the newest failed AppX deployment operation for a package since a point in time, with its activity
+        ID (for Get-AppPackageLog -ActivityID) and the step that failed. $null when the log has nothing.
+    .DESCRIPTION
+        Remove-AppxPackage in PowerShell 7 can report a failure as just "Access is denied."; Windows' own log,
+        Microsoft-Windows-AppXDeploymentServer/Operational, has the detail: events 401/404 (operation failed) and
+        605/648 ("Error 0x80070005: Failure in the OptionalDependenciesHandled state handler.") share an activity ID.
+    .PARAMETER PackageName
+        Full or provisioned package name; matched by its name part (before the first underscore).
+    .PARAMETER Since
+        Only events from this time on (the start of the removal call).
+    .OUTPUTS
+        PSCustomObject: ActivityId, Step - or $null
+    #>
+    param([Parameter(Mandatory)][string]$PackageName, [Parameter(Mandatory)][datetime]$Since)
+    $Log = 'Microsoft-Windows-AppXDeploymentServer/Operational'
+    $Needle = ("$PackageName" -split '_')[0]
+    if (-not $Needle) { return $null }
+    $Failures = @()
+    try { $Failures = @(Get-WinEvent -FilterHashtable @{ LogName = $Log; Id = 401, 404; StartTime = $Since } -ErrorAction Stop) } catch { return $null }
+    $Hit = @($Failures | Where-Object { $null -ne $_.ActivityId -and "$($_.Message)".IndexOf($Needle, [StringComparison]::OrdinalIgnoreCase) -ge 0 } | Sort-Object TimeCreated -Descending) | Select-Object -First 1
+    if ($null -eq $Hit) { return $null }
+    $Activity = "$($Hit.ActivityId)"
+    $Step = ''
+    try {
+        $StepEvent = @(Get-WinEvent -FilterHashtable @{ LogName = $Log; Id = 605, 648; StartTime = $Since } -ErrorAction Stop | Where-Object { "$($_.ActivityId)" -eq $Activity } | Sort-Object TimeCreated) | Select-Object -First 1
+        if ($null -ne $StepEvent) { $Step = ("$($StepEvent.Message)" -replace '\s+', ' ').Trim() }
+    }
+    catch { $Step = '' }
+    return [pscustomobject]@{ ActivityId = $Activity; Step = $Step }
 }
 
 function Test-CodecElevated {

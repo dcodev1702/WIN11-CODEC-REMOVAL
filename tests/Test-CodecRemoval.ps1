@@ -121,6 +121,20 @@ try {
     Assert 'hresult: unknown code keeps the message' ((ConvertTo-CodecHresultText 'HRESULT: 0x80004005 unspecified').Text -like '*0x80004005 unspecified*')
     Assert 'hresult: no code -> message, empty code' ((ConvertTo-CodecHresultText "no code  here`n at all").Code -eq '' -and (ConvertTo-CodecHresultText "no code  here`n at all").Text -eq 'no code here at all')
     Assert 'hresult: every catalogued code has text' (@($CodecHresultText.Keys | Where-Object { -not $CodecHresultText[$_] }).Count -eq 0)
+    $Denied = ConvertTo-CodecHresultText -Message 'Access is denied.' -HResult -2147024891
+    Assert 'hresult: PowerShell 7 "Access is denied." -> 0x80070005 from the exception, deployment-service text' ($Denied.Code -eq '0x80070005' -and $Denied.Text -like '0x80070005 E_ACCESSDENIED - the app deployment service*run the same command again*') $Denied.Text
+    Assert 'hresult: a code in the message wins over the exception HResult' ((ConvertTo-CodecHresultText -Message 'Deployment failed with HRESULT: 0x80073D02, in use' -HResult -2147024891).Code -eq '0x80073D02')
+    $Generic = ConvertTo-CodecHresultText -Message 'Something odd happened.' -HResult -2146233088
+    Assert 'hresult: a generic exception HResult (0x80131500) is ignored' ($Generic.Code -eq '' -and $Generic.Text -eq 'Something odd happened.')
+    $Sharing = ConvertTo-CodecHresultText -Message 'The process cannot access the file.' -HResult -2147024864
+    Assert 'hresult: an uncatalogued Win32 code from the exception is shown with the message' ($Sharing.Code -eq '0x80070020' -and $Sharing.Text -eq '0x80070020 The process cannot access the file.')
+
+    # ---- D2. Module origin and the deployment log lookup
+    Assert 'module origin: implicit-remoting proxy -> compatibility' ((Get-CodecModuleOrigin ([pscustomobject]@{ PrivateData = @{ ImplicitRemoting = $true }; ModuleBase = 'C:\x' })) -eq 'Windows PowerShell compatibility')
+    Assert 'module origin: remoteIpMoProxy folder -> compatibility' ((Get-CodecModuleOrigin ([pscustomobject]@{ PrivateData = $null; ModuleBase = 'C:\Users\u\AppData\Local\Temp\remoteIpMoProxy_Dism_3.0_localhost_1234' })) -eq 'Windows PowerShell compatibility')
+    Assert 'module origin: an inbox module -> native' ((Get-CodecModuleOrigin ([pscustomobject]@{ PrivateData = $null; ModuleBase = 'C:\WINDOWS\system32\WindowsPowerShell\v1.0\Modules\Appx' })) -eq 'native')
+    Assert 'module origin: a real loaded module -> native; none -> empty' ((Get-CodecModuleOrigin (Get-Command Get-ChildItem).Module) -eq 'native' -and (Get-CodecModuleOrigin $null) -eq '')
+    Assert 'deployment log: a package with no failure -> $null (read-only query of the real log)' ($null -eq (Find-CodecDeploymentError -PackageName 'Microsoft.NoSuchCodecTest_1.0.0.0_x64__8wekyb3d8bbwe' -Since (Get-Date).AddMinutes(-10)))
 
     # ---- E. Blocking processes
     $Hevc = New-FakePackage 'Microsoft.HEVCVideoExtension' '2.5.48.0'
@@ -158,6 +172,18 @@ try {
     $PlanKeyOnly = @(Get-CodecPlan -Target @('Microsoft.WebpImageExtension') -Installed @() -Provisioned @() -DeprovisionedKey @())
     Assert 'plan: nothing present, no key -> not Present, not clean, one action (key)' (-not $PlanKeyOnly[0].Present -and -not $PlanKeyOnly[0].AlreadyClean -and $PlanKeyOnly[0].Actions.Count -eq 1)
     Assert 'plan: unknown target -> STOP' (Throws { Get-CodecPlan -Target @('Microsoft.Photos') })
+
+    # ---- F2. Package listing (-ListPackages)
+    $List = @(Get-CodecPackageListing -Installed @($Hevc, (New-FakePackage 'Microsoft.VP9VideoExtensions' '1.2.20.0'), (New-FakePackage 'Microsoft.Photos')) -Provisioned @((New-FakeProvisioned 'Microsoft.HEIFImageExtension' '1.2.48.0')) -DeprovisionedKey @('Microsoft.RawImageExtension_8wekyb3d8bbwe'))
+    $LByName = @{}; foreach ($R in $List) { $LByName[$R.Package] = $R }
+    Assert 'listing: one row per catalog package, in catalog order, nothing else' ($List.Count -eq $CodecCatalog.Count -and $List[0].Package -eq $CodecCatalog[0].Name -and -not $LByName.ContainsKey('Microsoft.Photos'))
+    Assert 'listing: installed package -> present, versions and users, no key' ($LByName['Microsoft.HEVCVideoExtension'].Present -and $LByName['Microsoft.HEVCVideoExtension'].State -eq 'installed 2.5.48.0 for SKYNET\alice (Installed), SKYNET\bob (Installed); no Deprovisioned key')
+    Assert 'listing: provisioned only -> present' ($LByName['Microsoft.HEIFImageExtension'].Present -and $LByName['Microsoft.HEIFImageExtension'].State -eq 'provisioned 1.2.48.0; no Deprovisioned key')
+    Assert 'listing: key only -> removed, not present' (-not $LByName['Microsoft.RawImageExtension'].Present -and $LByName['Microsoft.RawImageExtension'].State -like 'removed:*Deprovisioned key present')
+    Assert 'listing: nothing -> not on this computer' (-not $LByName['Microsoft.WebpImageExtension'].Present -and $LByName['Microsoft.WebpImageExtension'].State -eq 'not on this computer')
+    Assert 'listing: default targets flagged, others not; Store ID and Breaks carried' ($LByName['Microsoft.HEVCVideoExtension'].DefaultTarget -eq ($CodecDefaultPackages -contains 'Microsoft.HEVCVideoExtension') -and -not $LByName['Microsoft.HEVCVideoExtensions'].DefaultTarget -and $LByName['Microsoft.VP9VideoExtensions'].StoreId -eq '9N4D0MSMP0PT' -and $LByName['Microsoft.VP9VideoExtensions'].Breaks)
+    $ListOff = @(Get-CodecPackageListing -Provisioned @((New-FakeProvisioned 'Microsoft.HEIFImageExtension' '1.2.48.0')) -Offline)
+    Assert 'listing: offline wording' ((@($ListOff | Where-Object { $_.Package -eq 'Microsoft.HEIFImageExtension' })[0].State -like 'provisioned 1.2.48.0 in the image*') -and (@($ListOff | Where-Object { $_.Package -eq 'Microsoft.WebpImageExtension' })[0].State -eq 'not in the image'))
 
     # ---- G. Mounted image validation
     $Mount = Join-Path $Tmp 'Mount'
@@ -226,8 +252,11 @@ try {
         $Global:MockState.Calls.Add("Remove-AppxPackage $Package AllUsers=$AllUsers")
         if ($Global:MockState.FailOnce.ContainsKey($Package) -and $Global:MockState.FailOnce[$Package] -gt 0) { $Global:MockState.FailOnce[$Package]--; throw "Remove-AppxPackage: Deployment failed with HRESULT: 0x80073D02, The package could not be installed because resources it modifies are currently in use. NOTE: For additional information, look for [ActivityId] ..." }
         if ($Global:MockState.FailOnce.ContainsKey("gone:$Package")) { throw 'Remove-AppxPackage: Deployment failed with HRESULT: 0x80073CF1, Package could not be found.' }
+        # PowerShell 7 reports the deployment service's access denied as just this message, HResult 0x80070005
+        if ($Global:MockState.FailOnce.ContainsKey("denied:$Package") -and $Global:MockState.FailOnce["denied:$Package"] -gt 0) { $Global:MockState.FailOnce["denied:$Package"]--; throw (New-Object System.UnauthorizedAccessException 'Access is denied.') }
         $Global:MockState.Installed = @($Global:MockState.Installed | Where-Object { $_.PackageFullName -ne $Package })
     }
+    function Find-CodecDeploymentError { param([string]$PackageName, [datetime]$Since) $Global:MockState.Calls.Add("Find-CodecDeploymentError $PackageName"); return $Global:MockState.DeploymentError }
     function Get-AppxProvisionedPackage { [CmdletBinding()] param([switch]$Online, [string]$Path) $Global:MockState.Calls.Add("Get-AppxProvisionedPackage Online=$Online Path=$Path"); return @($Global:MockState.Provisioned) }
     function Remove-AppxProvisionedPackage { [CmdletBinding()] param([switch]$Online, [string]$Path, [string]$PackageName) $Global:MockState.Calls.Add("Remove-AppxProvisionedPackage $PackageName Online=$Online Path=$Path"); $Global:MockState.Provisioned = @($Global:MockState.Provisioned | Where-Object { $_.PackageName -ne $PackageName }) }
     function Get-Process { [CmdletBinding()] param([int[]]$Id) if ($PSBoundParameters.ContainsKey('Id')) { return @($Global:MockState.Processes | Where-Object { $Id -contains $_.Id }) }; return @($Global:MockState.Processes) }
@@ -248,7 +277,7 @@ try {
         $Global:MockState.Installed = @($CodecDefaultPackages | ForEach-Object { New-FakePackage $_ (Get-MockVersion $_) }) + @(New-FakePackage 'Microsoft.Photos')
         $Global:MockState.Provisioned = @($CodecDefaultPackages | ForEach-Object { New-FakeProvisioned $_ (Get-MockVersion $_) }) + @(New-FakeProvisioned $Bystander)
         $Global:MockState.Processes = @((New-FakeProcess 'notepad' 5000 @('C:\Windows\System32\kernel32.dll')))
-        $Global:MockState.Calls.Clear(); $Global:MockState.Events.Clear(); $Global:MockState.FailOnce = @{}; $Global:MockState.Elevated = $true; $Global:MockState.Build = 26100
+        $Global:MockState.Calls.Clear(); $Global:MockState.Events.Clear(); $Global:MockState.FailOnce = @{}; $Global:MockState.Elevated = $true; $Global:MockState.Build = 26100; $Global:MockState.DeploymentError = $null
         if (Test-Path -LiteralPath $TestDeprovisioned) { Remove-Item -LiteralPath $TestDeprovisioned -Recurse -Force }
         New-Item -Path $TestDeprovisioned -Force | Out-Null
     }
@@ -334,6 +363,7 @@ try {
     Assert 'e2e in use: HEVC not removed for users, but deprovisioned and keyed; the other targets fully done' ((Calls 'Remove-AppxPackage Microsoft.HEVC*').Count -eq 0 -and (Calls 'Remove-AppxPackage Microsoft.Webp*').Count -eq 1 -and (Calls 'Remove-AppxPackage Microsoft.Raw*').Count -eq 1 -and (Calls 'Remove-AppxPackage * AllUsers=True').Count -eq ($TargetCount - 1) -and (Calls 'Remove-AppxProvisionedPackage Microsoft.HEVC*').Count -eq 1 -and (Test-CodecDeprovisionedKey -Root $TestDeprovisioned -FamilyName 'Microsoft.HEVCVideoExtension_8wekyb3d8bbwe'))
     Assert 'e2e in use: verification WARN for HEVC (still registered), OK for the other targets, event 2001' ((Rows $Run 'WARN' 'Microsoft.HEVCVideoExtension verified').Count -eq 1 -and (Rows $Run 'OK' '*verified').Count -eq ($TargetCount - 1) -and @($Global:MockState.Events | Where-Object { $_ -like '2001 *' }).Count -eq 1 -and (Calls 'Stop-Process*').Count -eq 0)
     Assert 'e2e in use: hint says run again' ($Run.Text -like '*Not finished for: Microsoft.HEVCVideoExtension*run the same command again*')
+    Assert 'e2e in use: the in-use hint, not the access-denied one' ($Run.Text -like '*In use (Microsoft.HEVCVideoExtension): close the apps named in the rows above*' -and $Run.Text -notlike '*Access denied (*')
 
     # K8. The same with -StopBlockingProcesses: processes stopped, package removed, explorer restarted
     Reset-Mock
@@ -397,8 +427,51 @@ try {
     $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true; MountedImagePath = "$env:SystemDrive\" }
     Assert 'e2e offline: the running OS as image path -> STOP' ($Run.Exit -eq 1 -and (Rows $Run 'FAIL' 'Stopped')[0].Detail -like '*running operating system*')
 
-    # K16. The main script's own guard: a module-provided Remove-AppxPackage visible under the harness stops the run
-    #      before the transcript, the inventory or any call. The fake module replaces the mock in this scope.
+    # K16. Access denied from the deployment service (seen live on build 28000): the row carries the code, the failing
+    #      step and the activity ID; the hint says it is not about closing apps; the rerun finishes the package.
+    Reset-Mock
+    $DeniedPackage = Get-MockPackage 'Microsoft.RawImageExtension'
+    $Global:MockState.FailOnce["denied:$($DeniedPackage.PackageFullName)"] = 1
+    $Global:MockState.DeploymentError = [pscustomobject]@{ ActivityId = '6c3a0a34-645e-0004-d77c-686c5e64dd01'; Step = 'Error 0x80070005: Failure in the OptionalDependenciesHandled state handler.' }
+    $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true }
+    Assert 'e2e access denied: FAIL row shows 0x80070005, the failing step and the activity, exit 1' ($Run.Exit -eq 1 -and (Rows $Run 'FAIL' 'Microsoft.RawImageExtension users')[0].Detail -like '*failed: 0x80070005 E_ACCESSDENIED*OptionalDependenciesHandled state handler.*Get-AppPackageLog -ActivityID 6c3a0a34-645e-0004-d77c-686c5e64dd01') ((Rows $Run 'FAIL' 'Microsoft.RawImageExtension users')[0].Detail)
+    Assert 'e2e access denied: the hint explains it and does not say to close apps' ($Run.Text -like '*Access denied (Microsoft.RawImageExtension): 0x80070005 came from Windows'' app deployment service*' -and $Run.Text -notlike '*close the apps*' -and $Run.Text -like '*Get-AppPackageLog -ActivityID 6c3a0a34-645e-0004-d77c-686c5e64dd01*')
+    Assert 'e2e access denied: the rerun command names only the unfinished package' ($Run.Text -like '*Run again:  *Remove-CodecExtension.ps1 -Mode Remove -Package Microsoft.RawImageExtension*')
+    Assert 'e2e access denied: the other targets are done; Raw deprovisioned and keyed anyway' ((Rows $Run 'OK' '*verified').Count -eq ($TargetCount - 1) -and (Calls 'Remove-AppxProvisionedPackage Microsoft.RawImageExtension*').Count -eq 1 -and (Test-CodecDeprovisionedKey -Root $TestDeprovisioned -FamilyName 'Microsoft.RawImageExtension_8wekyb3d8bbwe'))
+    $Global:MockState.Calls.Clear()
+    $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true; Package = @('Microsoft.RawImageExtension') }
+    Assert 'e2e access denied: the rerun removes the last registration, exit 0' ($Run.Exit -eq 0 -and (Calls 'Remove-AppxPackage Microsoft.Raw*').Count -eq 1 -and (Rows $Run 'OK' 'Microsoft.RawImageExtension verified').Count -eq 1 -and $Run.Text -like '*Done. No reboot is needed. Confirm any time with:  *Remove-CodecExtension.ps1 -Mode Check*')
+
+    # K17. -ListPackages: every catalog package, the -Package names, the commands; read-only
+    Reset-Mock
+    $Global:MockState.Installed += @(New-FakePackage $Bystander '1.2.20.0')
+    $InventoriesBefore = @(Get-ChildItem -LiteralPath $Tmp -Filter 'codec-inventory-*').Count
+    $Run = Invoke-Main @{ ListPackages = $true }
+    $ListCsv = Get-ChildItem -LiteralPath $Tmp -Filter 'codec-packages-*.csv' | Sort-Object LastWriteTime, Name | Select-Object -Last 1
+    $ListRows = @(Import-Csv -LiteralPath $ListCsv.FullName)
+    $PresentOrder = @(@($CodecCatalog | ForEach-Object { $_.Name } | Where-Object { $CodecDefaultPackages -contains $_ }) + @($Bystander))
+    Assert 'e2e list: exit 0, transcript named List, one CSV row per catalog package' ($Run.Exit -eq 0 -and $ListRows.Count -eq $CodecCatalog.Count -and (Get-ChildItem -LiteralPath $Tmp -Filter 'Remove-CodecExtension-List-*.log').Count -ge 1 -and (Rows $Run 'OK' 'Package list')[0].Detail -like "$($CodecCatalog.Count) package(s) in the catalog, $($TargetCount + 1) present*")
+    Assert 'e2e list: the table shows the -Package name, the default flag and the state' ($Run.Text -like '*Package (use with -Package)*Store listing*Default*State*' -and $Run.Text -like "*$Bystander*installed 1.2.20.0 for SKYNET\alice (Installed), SKYNET\bob (Installed); provisioned 1.0.0.0; no Deprovisioned key*")
+    Assert 'e2e list: one-package command uses a default target, the all-present command lists defaults first' ($Run.Text -like "*Remove one package*-Mode Remove -Package $($PresentOrder[0])*" -and $Run.Text -like "*Remove all $($TargetCount + 1) present packages:*-Mode Remove -Package $($PresentOrder -join ', ')*")
+    Assert 'e2e list: present packages that are not default targets are called out' ($Run.Text -like "*Not default targets: $Bystander. The Breaks column*")
+    Assert 'e2e list: read-only - nothing removed, no key, no event, no inventory, no process scan' ((Calls 'Remove-*').Count -eq 0 -and @(Get-ChildItem -LiteralPath $TestDeprovisioned).Count -eq 0 -and $Global:MockState.Events.Count -eq 0 -and @(Get-ChildItem -LiteralPath $Tmp -Filter 'codec-inventory-*').Count -eq $InventoriesBefore)
+
+    # K18. -ListPackages against a mounted image: provisioning of the image, commands carry -MountedImagePath
+    Reset-Mock
+    $Global:MockState.OfflineRoot = "$TestKeyRoot\OfflineHiveList"
+    New-Item -Path $Global:MockState.OfflineRoot -Force | Out-Null
+    $Run = Invoke-Main @{ ListPackages = $true; MountedImagePath = $Mount }
+    Assert 'e2e list offline: image provisioning listed, commands keep -MountedImagePath, no user query' ($Run.Exit -eq 0 -and $Run.Text -like "*Codec packages this script can remove - mounted image*" -and $Run.Text -like '*provisioned 2.5.48.0 in the image*' -and $Run.Text -like "*-Mode Remove -Package *-MountedImagePath '$Mount'*" -and (Calls 'Get-AppxPackage*').Count -eq 0)
+
+    # K19. -ListPackages cannot be combined with -Mode: refused by parameter binding, before anything runs
+    Reset-Mock
+    $BindText = ''
+    try { $BindRun = Invoke-Main @{ ListPackages = $true; Mode = 'Remove' }; $BindText = $BindRun.Text } catch { $BindText = "$($_.Exception.Message)" }
+    Assert 'e2e list: -ListPackages with -Mode is rejected before anything runs' ($BindText -like '*Parameter set cannot be resolved*' -and (Calls '*').Count -eq 0) $BindText
+
+    # K20. The main script's own guard: a module-provided Remove-AppxPackage visible under the harness stops the run
+    #      before the transcript, the inventory or any call. The fake module replaces the mock in this scope, and
+    #      removing it removes the mock too - so this test runs last.
     Reset-Mock
     New-Module -Name CodecFakeRealModule -ScriptBlock { function Remove-AppxPackage { [CmdletBinding()] param([string]$Package, [switch]$AllUsers) throw 'a real command was reached' } } | Import-Module -Scope Local
     $GuardMessage = ''
@@ -408,7 +481,7 @@ try {
     Assert 'e2e guard: nothing was called or changed' ((Calls '*').Count -eq 0 -and $Global:MockState.Installed.Count -eq ($TargetCount + 1) -and @(Get-ChildItem -LiteralPath $TestDeprovisioned).Count -eq 0)
 }
 finally {
-    foreach ($F in 'Read-Host', 'Test-Interactive', 'Test-CodecElevated', 'Test-CodecSystemAccount', 'Get-CodecOsInfo', 'Initialize-CodecModules', 'Get-CodecStoreAccess', 'Write-CodecEvent', 'Get-AppxPackage', 'Remove-AppxPackage', 'Get-AppxProvisionedPackage', 'Remove-AppxProvisionedPackage', 'Get-Process', 'Stop-Process', 'Start-Sleep', 'Start-Process', 'Use-CodecOfflineHive') { Remove-Item -LiteralPath "Function:\$F" -ErrorAction SilentlyContinue }
+    foreach ($F in 'Read-Host', 'Test-Interactive', 'Test-CodecElevated', 'Test-CodecSystemAccount', 'Get-CodecOsInfo', 'Initialize-CodecModules', 'Get-CodecStoreAccess', 'Write-CodecEvent', 'Find-CodecDeploymentError', 'Get-AppxPackage', 'Remove-AppxPackage', 'Get-AppxProvisionedPackage', 'Remove-AppxProvisionedPackage', 'Get-Process', 'Stop-Process', 'Start-Sleep', 'Start-Process', 'Use-CodecOfflineHive') { Remove-Item -LiteralPath "Function:\$F" -ErrorAction SilentlyContinue }
     Remove-Variable -Name MockState, InteractiveMock, Answers -Scope Global -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath 'HKLM:\CodecTestHive') { & (Join-Path $env:SystemRoot 'System32\reg.exe') unload 'HKLM\CodecTestHive' 2>&1 | Out-Null }
     if (Test-Path -LiteralPath $TestKeyRoot) { Remove-Item -LiteralPath $TestKeyRoot -Recurse -Force -ErrorAction SilentlyContinue }
