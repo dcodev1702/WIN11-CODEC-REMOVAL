@@ -1,0 +1,6 @@
+# Run artifacts stay on the machine that ran the script (hostnames, user names, transcripts, inventories)
+/Logs/
+/Outputs/
+
+# Claude Code session files
+/.claude/
