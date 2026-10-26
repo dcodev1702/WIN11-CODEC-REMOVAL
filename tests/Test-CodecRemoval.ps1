@@ -92,7 +92,15 @@ try {
     }
 
     # ---- B. Catalog
-    Assert 'catalog: three default packages' ($CodecDefaultPackages.Count -eq 3 -and $CodecDefaultPackages -contains 'Microsoft.HEVCVideoExtension')
+    # Group K derives every count from this list, so changing the default targets needs no edit in this file.
+    $TargetCount = $CodecDefaultPackages.Count
+    Assert 'catalog: the default list is not empty and has no duplicates' ($TargetCount -gt 0 -and @($CodecDefaultPackages | Select-Object -Unique).Count -eq $TargetCount)
+    $MainAst = [Management.Automation.Language.Parser]::ParseFile($Main, [ref]$null, [ref]$null)
+    $PackageParam = @($MainAst.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Package' })[0]
+    $ScriptDefault = @($PackageParam.DefaultValue.FindAll({ param($Node) $Node -is [Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { $_.Value })
+    Assert 'catalog: the script''s -Package default is the catalog default list, in the same order' (($ScriptDefault -join ',') -eq ($CodecDefaultPackages -join ',')) ($ScriptDefault -join ',')
+    $ValidateSet = @($PackageParam.Attributes | Where-Object { $_.TypeName.Name -eq 'ValidateSet' } | ForEach-Object { $_.PositionalArguments } | ForEach-Object { $_.Value })
+    Assert 'catalog: the script''s -Package ValidateSet lists exactly the catalog names' ((@($ValidateSet | Sort-Object) -join ',') -eq (@($CodecCatalog | ForEach-Object { $_.Name } | Sort-Object) -join ',')) ($ValidateSet -join ',')
     foreach ($N in $CodecDefaultPackages) { $E = Get-CodecCatalogEntry $N; Assert "catalog: $N has a verified Store ID, origin and impact" ($null -ne $E -and $E.StoreId -match '^9[A-Z0-9]{11}$' -and $E.Origin -and $E.Breaks) }
     Assert 'catalog: lookup is case-insensitive and trims' ((Get-CodecCatalogEntry ' microsoft.rawimageextension ').StoreId -eq '9NCTDW2W1BH8')
     Assert 'catalog: unknown name -> $null' ($null -eq (Get-CodecCatalogEntry 'Microsoft.Photos'))
@@ -136,11 +144,13 @@ try {
     Assert 'blockers: live scan of this computer runs and returns an array' ($null -ne $Live -and $Live.Count -eq 0)
 
     # ---- F. Plan
-    $Plan = @(Get-CodecPlan -Target $CodecDefaultPackages -Installed @($Hevc, $Webp, (New-FakePackage 'Microsoft.Photos')) -Provisioned @((New-FakeProvisioned 'Microsoft.HEVCVideoExtension' '2.5.48.0'), (New-FakeProvisioned 'Microsoft.HEIFImageExtension')) -DeprovisionedKey @('Microsoft.RawImageExtension_8wekyb3d8bbwe', 'Microsoft.Copilot_8wekyb3d8bbwe'))
+    $Plan = @(Get-CodecPlan -Target @('Microsoft.WebpImageExtension', 'Microsoft.HEVCVideoExtension', 'Microsoft.RawImageExtension', 'Microsoft.HEIFImageExtension') -Installed @($Hevc, $Webp, (New-FakePackage 'Microsoft.Photos')) -Provisioned @((New-FakeProvisioned 'Microsoft.HEVCVideoExtension' '2.5.48.0'), (New-FakeProvisioned 'Microsoft.HEIFImageExtension')) -DeprovisionedKey @('Microsoft.RawImageExtension_8wekyb3d8bbwe', 'Microsoft.Copilot_8wekyb3d8bbwe'))
     $PH = $Plan | Where-Object { $_.Name -eq 'Microsoft.HEVCVideoExtension' }
     $PW = $Plan | Where-Object { $_.Name -eq 'Microsoft.WebpImageExtension' }
     $PR = $Plan | Where-Object { $_.Name -eq 'Microsoft.RawImageExtension' }
-    Assert 'plan: three rows in target order' ($Plan.Count -eq 3 -and $Plan[0].Name -eq 'Microsoft.WebpImageExtension')
+    $PF = $Plan | Where-Object { $_.Name -eq 'Microsoft.HEIFImageExtension' }
+    Assert 'plan: four rows in target order' ($Plan.Count -eq 4 -and $Plan[0].Name -eq 'Microsoft.WebpImageExtension' -and $Plan[3].Name -eq 'Microsoft.HEIFImageExtension')
+    Assert 'plan: HEIF provisioned only, no key -> deprovision + key, Present' ($PF.Installed.Count -eq 0 -and $PF.Provisioned.Count -eq 1 -and $PF.Actions.Count -eq 2 -and $PF.Actions[0] -like 'deprovision Microsoft.HEIFImageExtension_*' -and $PF.Present)
     Assert 'plan: HEVC installed + provisioned + no key -> 3 actions, Present, not clean' ($PH.Installed.Count -eq 1 -and $PH.Provisioned.Count -eq 1 -and -not $PH.KeyPresent -and $PH.Actions.Count -eq 3 -and $PH.Present -and -not $PH.AlreadyClean)
     Assert 'plan: WebP installed only -> remove + key' ($PW.Installed.Count -eq 1 -and $PW.Provisioned.Count -eq 0 -and $PW.Actions.Count -eq 2 -and $PW.Actions[0] -like 'remove Microsoft.WebpImageExtension_1.2.31.0_x64__8wekyb3d8bbwe*')
     Assert 'plan: Raw nothing installed, key present -> AlreadyClean, no actions' ($PR.AlreadyClean -and -not $PR.Present -and $PR.Actions.Count -eq 0)
@@ -225,9 +235,18 @@ try {
     function Start-Sleep { [CmdletBinding()] param([int]$Seconds, [int]$Milliseconds) }
     function Start-Process { [CmdletBinding()] param([string]$FilePath) $Global:MockState.Calls.Add("Start-Process $FilePath") }
     function Use-CodecOfflineHive { param([string]$HivePath, [scriptblock]$Script, [string]$KeyName = '') $Global:MockState.Calls.Add("Use-CodecOfflineHive $HivePath"); return (& $Script $Global:MockState.OfflineRoot) }
+    # The mock computer has every default target installed and provisioned, plus Photos (installed) and one codec that
+    # is not a target (provisioned). Known packages get realistic versions; tests look packages up by name.
+    $MockVersions = @{ 'Microsoft.WebpImageExtension' = '1.2.31.0'; 'Microsoft.HEVCVideoExtension' = '2.5.48.0'; 'Microsoft.RawImageExtension' = '2.5.35.0'; 'Microsoft.HEIFImageExtension' = '1.2.48.0' }
+    function Get-MockVersion([string]$Name) { if ($MockVersions.ContainsKey($Name)) { return $MockVersions[$Name] }; return '1.0.0.0' }
+    function Get-MockPackage([string]$Name) { return @($Global:MockState.Installed | Where-Object { $_.Name -eq $Name })[0] }
+    $Bystander = @('Microsoft.VP9VideoExtensions', 'Microsoft.MPEG2VideoExtension', 'Microsoft.WebMediaExtensions' | Where-Object { $CodecDefaultPackages -notcontains $_ })[0]
+    foreach ($Needed in 'Microsoft.WebpImageExtension', 'Microsoft.HEVCVideoExtension', 'Microsoft.RawImageExtension') {
+        if ($CodecDefaultPackages -notcontains $Needed) { throw "STOP: the end-to-end tests model in-use and retry cases on $Needed; keep it among the default targets or adapt group K." }
+    }
     function Reset-Mock {
-        $Global:MockState.Installed = @((New-FakePackage 'Microsoft.WebpImageExtension' '1.2.31.0'), (New-FakePackage 'Microsoft.HEVCVideoExtension' '2.5.48.0'), (New-FakePackage 'Microsoft.RawImageExtension' '2.5.35.0'), (New-FakePackage 'Microsoft.Photos'))
-        $Global:MockState.Provisioned = @((New-FakeProvisioned 'Microsoft.WebpImageExtension' '1.2.31.0'), (New-FakeProvisioned 'Microsoft.HEVCVideoExtension' '2.5.48.0'), (New-FakeProvisioned 'Microsoft.RawImageExtension' '2.5.35.0'), (New-FakeProvisioned 'Microsoft.HEIFImageExtension'))
+        $Global:MockState.Installed = @($CodecDefaultPackages | ForEach-Object { New-FakePackage $_ (Get-MockVersion $_) }) + @(New-FakePackage 'Microsoft.Photos')
+        $Global:MockState.Provisioned = @($CodecDefaultPackages | ForEach-Object { New-FakeProvisioned $_ (Get-MockVersion $_) }) + @(New-FakeProvisioned $Bystander)
         $Global:MockState.Processes = @((New-FakeProcess 'notepad' 5000 @('C:\Windows\System32\kernel32.dll')))
         $Global:MockState.Calls.Clear(); $Global:MockState.Events.Clear(); $Global:MockState.FailOnce = @{}; $Global:MockState.Elevated = $true; $Global:MockState.Build = 26100
         if (Test-Path -LiteralPath $TestDeprovisioned) { Remove-Item -LiteralPath $TestDeprovisioned -Recurse -Force }
@@ -261,41 +280,42 @@ try {
     Assert 'e2e guard: every system command resolves to a harness function, not a cmdlet or module' ($NotMocked.Count -eq 0) ($NotMocked -join ' ')
     if ($NotMocked.Count -gt 0) { throw "STOP: refusing to run the end-to-end tests, these commands are real: $($NotMocked -join ' ')" }
 
-    # K1. Check: everything present -> three FAIL rows, exit 1, nothing called that changes
+    # K1. Check: everything present -> one FAIL row per target, exit 1, nothing called that changes
     Reset-Mock
     $Run = Invoke-Main @{ Mode = 'Check' }
-    Assert 'e2e check: three PRESENT rows, exit 1' ((Rows $Run 'FAIL').Count -eq 3 -and $Run.Exit -eq 1 -and (Rows $Run 'FAIL' 'Microsoft.HEVCVideoExtension')[0].Detail -like 'PRESENT - installed 2.5.48.0 for SKYNET\alice (Installed), SKYNET\bob (Installed); provisioned 2.5.48.0*no Deprovisioned key')
+    Assert 'e2e check: one PRESENT row per target, exit 1' ((Rows $Run 'FAIL').Count -eq $TargetCount -and $Run.Exit -eq 1 -and (Rows $Run 'FAIL' 'Microsoft.HEVCVideoExtension')[0].Detail -like 'PRESENT - installed 2.5.48.0 for SKYNET\alice (Installed), SKYNET\bob (Installed); provisioned 2.5.48.0*no Deprovisioned key')
     Assert 'e2e check: changes nothing' ((Calls 'Remove-*').Count -eq 0 -and (Calls 'Stop-Process*').Count -eq 0 -and $Global:MockState.Events.Count -eq 0 -and @(Get-ChildItem -LiteralPath $TestDeprovisioned).Count -eq 0)
     Assert 'e2e check: Store row OK when the Store is blocked by policy' ((Rows $Run 'OK' 'Microsoft Store').Count -eq 1)
     Assert 'e2e check: transcript and CSV written' ((Get-ChildItem -LiteralPath $Tmp -Filter 'Remove-CodecExtension-Check-*.log').Count -ge 1 -and $Run.Rows.Count -gt 5)
 
     # K2. Check with a blocker: the row names the process
     Reset-Mock
-    $Global:MockState.Processes += @(New-FakeProcess 'msedge' 1512 @("$($Global:MockState.Installed[1].InstallLocation)\hevcdecoder_store.dll"))
+    $Global:MockState.Processes += @(New-FakeProcess 'msedge' 1512 @("$((Get-MockPackage 'Microsoft.HEVCVideoExtension').InstallLocation)\hevcdecoder_store.dll"))
     $Run = Invoke-Main @{ Mode = 'Check' }
     Assert 'e2e check: in-use process named in the HEVC row and in the hint' ((Rows $Run 'FAIL' 'Microsoft.HEVCVideoExtension')[0].Detail -like '*IN USE by msedge (PID 1512) hevcdecoder_store.dll*' -and $Run.Text -like '*would block the removal for users: msedge (PID 1512)*')
 
     # K3. Remove -WhatIf: plan only
     Reset-Mock
     $Run = Invoke-Main @{ Mode = 'Remove'; WhatIf = $true }
-    Assert 'e2e whatif: exit 0, WhatIf rows for users, provisioning and key' ($Run.Exit -eq 0 -and (Rows $Run 'OK' '*users').Count -eq 3 -and (Rows $Run 'OK' '*provisioning').Count -eq 3 -and (Rows $Run 'OK' '*key').Count -eq 3 -and @(Rows $Run 'OK' '*users' | Where-Object { $_.Detail -notlike 'WhatIf:*' }).Count -eq 0)
+    Assert 'e2e whatif: exit 0, WhatIf rows for users, provisioning and key' ($Run.Exit -eq 0 -and (Rows $Run 'OK' '*users').Count -eq $TargetCount -and (Rows $Run 'OK' '*provisioning').Count -eq $TargetCount -and (Rows $Run 'OK' '*key').Count -eq $TargetCount -and @(Rows $Run 'OK' '*users' | Where-Object { $_.Detail -notlike 'WhatIf:*' }).Count -eq 0)
     Assert 'e2e whatif: nothing removed, no key, no event, no prompt' ((Calls 'Remove-*').Count -eq 0 -and @(Get-ChildItem -LiteralPath $TestDeprovisioned).Count -eq 0 -and $Global:MockState.Events.Count -eq 0 -and $Run.Text -like '*WhatIf: nothing was changed*')
     Assert 'e2e whatif: inventory-before JSON written' ((Get-ChildItem -LiteralPath $Tmp -Filter 'codec-inventory-*-before.json').Count -ge 1)
+    Assert 'e2e whatif: the plan header names this computer' ($Run.Text -like "*WhatIf - the plan for $($env:COMPUTERNAME):*")
 
     # K4. Remove, non-interactive, no -NoConfirm: STOP before any change
     Reset-Mock
     $Run = Invoke-Main @{ Mode = 'Remove' }
     Assert 'e2e remove: non-interactive without -NoConfirm stops, exit 1' ($Run.Exit -eq 1 -and (Rows $Run 'FAIL' 'Stopped')[0].Detail -like 'STOP:*non-interactive*')
-    Assert 'e2e remove: nothing changed by the STOP' ((Calls 'Remove-*').Count -eq 0 -and @(Get-ChildItem -LiteralPath $TestDeprovisioned).Count -eq 0 -and $Global:MockState.Installed.Count -eq 4)
+    Assert 'e2e remove: nothing changed by the STOP' ((Calls 'Remove-*').Count -eq 0 -and @(Get-ChildItem -LiteralPath $TestDeprovisioned).Count -eq 0 -and $Global:MockState.Installed.Count -eq ($TargetCount + 1))
 
     # K5. Remove -NoConfirm: everything removed, deprovisioned, keyed, verified
     Reset-Mock
     $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true }
-    Assert 'e2e remove: exit 0, three packages removed for all users' ($Run.Exit -eq 0 -and (Calls 'Remove-AppxPackage * AllUsers=True').Count -eq 3 -and @($Global:MockState.Installed).Count -eq 1 -and $Global:MockState.Installed[0].Name -eq 'Microsoft.Photos')
-    Assert 'e2e remove: three deprovisioned online, HEIF untouched' ((Calls 'Remove-AppxProvisionedPackage * Online=True*').Count -eq 3 -and @($Global:MockState.Provisioned).Count -eq 1 -and $Global:MockState.Provisioned[0].DisplayName -eq 'Microsoft.HEIFImageExtension')
-    Assert 'e2e remove: three Deprovisioned keys created' (@(Get-ChildItem -LiteralPath $TestDeprovisioned | Where-Object { $_.PSChildName -like 'Microsoft.*_8wekyb3d8bbwe' }).Count -eq 3)
-    Assert 'e2e remove: verified rows OK for all three, no FAIL/WARN' ((Rows $Run 'OK' '*verified').Count -eq 3 -and (Rows $Run 'FAIL').Count -eq 0 -and (Rows $Run 'WARN').Count -eq 0)
-    Assert 'e2e remove: events 1000 then 1001 x3' (@($Global:MockState.Events | Where-Object { $_ -like '1000 *' }).Count -eq 1 -and @($Global:MockState.Events | Where-Object { $_ -like '1001 *' }).Count -eq 3)
+    Assert 'e2e remove: exit 0, every target removed for all users' ($Run.Exit -eq 0 -and (Calls 'Remove-AppxPackage * AllUsers=True').Count -eq $TargetCount -and @($Global:MockState.Installed).Count -eq 1 -and $Global:MockState.Installed[0].Name -eq 'Microsoft.Photos')
+    Assert 'e2e remove: every target deprovisioned online, the non-target left provisioned' ((Calls 'Remove-AppxProvisionedPackage * Online=True*').Count -eq $TargetCount -and @($Global:MockState.Provisioned).Count -eq 1 -and $Global:MockState.Provisioned[0].DisplayName -eq $Bystander)
+    Assert 'e2e remove: one Deprovisioned key per target created' (@(Get-ChildItem -LiteralPath $TestDeprovisioned | Where-Object { $_.PSChildName -like 'Microsoft.*_8wekyb3d8bbwe' }).Count -eq $TargetCount)
+    Assert 'e2e remove: verified rows OK for every target, no FAIL/WARN' ((Rows $Run 'OK' '*verified').Count -eq $TargetCount -and (Rows $Run 'FAIL').Count -eq 0 -and (Rows $Run 'WARN').Count -eq 0)
+    Assert 'e2e remove: events 1000 then one 1001 per target' (@($Global:MockState.Events | Where-Object { $_ -like '1000 *' }).Count -eq 1 -and @($Global:MockState.Events | Where-Object { $_ -like '1001 *' }).Count -eq $TargetCount)
     Assert 'e2e remove: inventory before and after written' ((Get-ChildItem -LiteralPath $Tmp -Filter 'codec-inventory-*-after.json').Count -ge 1)
     Assert 'e2e remove: no process stopped when nothing holds a file' ((Calls 'Stop-Process*').Count -eq 0)
 
@@ -304,40 +324,40 @@ try {
     $Run = Invoke-Main @{ Mode = 'Remove' }
     Assert 'e2e idempotent: already current, exit 0, event 1002, nothing called' ($Run.Exit -eq 0 -and (Rows $Run 'OK' 'Already current').Count -eq 1 -and (Calls 'Remove-*').Count -eq 0 -and @($Global:MockState.Events | Where-Object { $_ -like '1002 *' }).Count -eq 1)
     $Run = Invoke-Main @{ Mode = 'Check' }
-    Assert 'e2e idempotent: Check is clean, exit 0' ($Run.Exit -eq 0 -and (Rows $Run 'OK' 'Microsoft.*Extension').Count -eq 3)
+    Assert 'e2e idempotent: Check is clean, exit 0' ($Run.Exit -eq 0 -and (Rows $Run 'OK' 'Microsoft.*Extension*').Count -eq $TargetCount)
 
     # K7. A package in use, no -StopBlockingProcesses: that one is FAIL and skipped, the others are done
     Reset-Mock
-    $Global:MockState.Processes += @((New-FakeProcess 'msedge' 1512 @("$($Global:MockState.Installed[1].InstallLocation)\hevcdecoder_store.dll")), (New-FakeProcess 'msedgewebview2' 8312 @("$($Global:MockState.Installed[1].InstallLocation)\hevcdecoder_store.dll")))
+    $Global:MockState.Processes += @((New-FakeProcess 'msedge' 1512 @("$((Get-MockPackage 'Microsoft.HEVCVideoExtension').InstallLocation)\hevcdecoder_store.dll")), (New-FakeProcess 'msedgewebview2' 8312 @("$((Get-MockPackage 'Microsoft.HEVCVideoExtension').InstallLocation)\hevcdecoder_store.dll")))
     $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true }
     Assert 'e2e in use: HEVC users row FAIL naming msedge and webview2, exit 1' ($Run.Exit -eq 1 -and (Rows $Run 'FAIL' 'Microsoft.HEVCVideoExtension users')[0].Detail -like 'NOT removed: Microsoft.HEVCVideoExtension_2.5.48.0_x64__8wekyb3d8bbwe is in use by msedge (PID 1512), msedgewebview2 (PID 8312)*-StopBlockingProcesses*')
-    Assert 'e2e in use: HEVC not removed for users, but deprovisioned and keyed; WebP and Raw fully done' ((Calls 'Remove-AppxPackage Microsoft.HEVC*').Count -eq 0 -and (Calls 'Remove-AppxPackage Microsoft.Webp*').Count -eq 1 -and (Calls 'Remove-AppxPackage Microsoft.Raw*').Count -eq 1 -and (Calls 'Remove-AppxProvisionedPackage Microsoft.HEVC*').Count -eq 1 -and (Test-CodecDeprovisionedKey -Root $TestDeprovisioned -FamilyName 'Microsoft.HEVCVideoExtension_8wekyb3d8bbwe'))
-    Assert 'e2e in use: verification WARN for HEVC (still registered), OK for the other two, event 2001' ((Rows $Run 'WARN' 'Microsoft.HEVCVideoExtension verified').Count -eq 1 -and (Rows $Run 'OK' '*verified').Count -eq 2 -and @($Global:MockState.Events | Where-Object { $_ -like '2001 *' }).Count -eq 1 -and (Calls 'Stop-Process*').Count -eq 0)
+    Assert 'e2e in use: HEVC not removed for users, but deprovisioned and keyed; the other targets fully done' ((Calls 'Remove-AppxPackage Microsoft.HEVC*').Count -eq 0 -and (Calls 'Remove-AppxPackage Microsoft.Webp*').Count -eq 1 -and (Calls 'Remove-AppxPackage Microsoft.Raw*').Count -eq 1 -and (Calls 'Remove-AppxPackage * AllUsers=True').Count -eq ($TargetCount - 1) -and (Calls 'Remove-AppxProvisionedPackage Microsoft.HEVC*').Count -eq 1 -and (Test-CodecDeprovisionedKey -Root $TestDeprovisioned -FamilyName 'Microsoft.HEVCVideoExtension_8wekyb3d8bbwe'))
+    Assert 'e2e in use: verification WARN for HEVC (still registered), OK for the other targets, event 2001' ((Rows $Run 'WARN' 'Microsoft.HEVCVideoExtension verified').Count -eq 1 -and (Rows $Run 'OK' '*verified').Count -eq ($TargetCount - 1) -and @($Global:MockState.Events | Where-Object { $_ -like '2001 *' }).Count -eq 1 -and (Calls 'Stop-Process*').Count -eq 0)
     Assert 'e2e in use: hint says run again' ($Run.Text -like '*Not finished for: Microsoft.HEVCVideoExtension*run the same command again*')
 
     # K8. The same with -StopBlockingProcesses: processes stopped, package removed, explorer restarted
     Reset-Mock
-    $Global:MockState.Processes += @((New-FakeProcess 'msedge' 1512 @("$($Global:MockState.Installed[1].InstallLocation)\hevcdecoder_store.dll")), (New-FakeProcess 'explorer' 4000 @("$($Global:MockState.Installed[0].InstallLocation)\WebpImageExtension.dll")))
+    $Global:MockState.Processes += @((New-FakeProcess 'msedge' 1512 @("$((Get-MockPackage 'Microsoft.HEVCVideoExtension').InstallLocation)\hevcdecoder_store.dll")), (New-FakeProcess 'explorer' 4000 @("$((Get-MockPackage 'Microsoft.WebpImageExtension').InstallLocation)\WebpImageExtension.dll")))
     $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true; StopBlockingProcesses = $true }
     Assert 'e2e stop: msedge and explorer stopped, explorer started again, exit 0' ($Run.Exit -eq 0 -and (Calls 'Stop-Process 1512').Count -eq 1 -and (Calls 'Stop-Process 4000').Count -eq 1 -and (Calls 'Start-Process *explorer.exe').Count -eq 1 -and (Rows $Run 'OK' 'Explorer')[0].Detail -eq 'started again')
-    Assert 'e2e stop: all three removed and verified' ((Calls 'Remove-AppxPackage * AllUsers=True').Count -eq 3 -and (Rows $Run 'OK' '*verified').Count -eq 3 -and (Rows $Run 'FAIL').Count -eq 0)
+    Assert 'e2e stop: every target removed and verified' ((Calls 'Remove-AppxPackage * AllUsers=True').Count -eq $TargetCount -and (Rows $Run 'OK' '*verified').Count -eq $TargetCount -and (Rows $Run 'FAIL').Count -eq 0)
     Assert 'e2e stop: the plan announced the processes to stop' ($Run.Text -like '*STOP these processes first*explorer (PID 4000), msedge (PID 1512)*Explorer is started again*')
 
     # K9. 0x80073D02 on the first try with -StopBlockingProcesses: retried and done
     Reset-Mock
-    $Global:MockState.FailOnce[$Global:MockState.Installed[1].PackageFullName] = 1
+    $Global:MockState.FailOnce[(Get-MockPackage 'Microsoft.HEVCVideoExtension').PackageFullName] = 1
     $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true; StopBlockingProcesses = $true }
     Assert 'e2e retry: second Remove-AppxPackage succeeds after 0x80073D02, exit 0' ($Run.Exit -eq 0 -and (Calls 'Remove-AppxPackage Microsoft.HEVC*').Count -eq 2 -and (Rows $Run 'WARN' 'Microsoft.HEVCVideoExtension users')[0].Detail -like 'try 1 - still in use by *' -and (Rows $Run 'OK' 'Microsoft.HEVCVideoExtension verified').Count -eq 1)
 
     # K10. 0x80073D02 without the switch: FAIL with the explanation, no retry
     Reset-Mock
-    $Global:MockState.FailOnce[$Global:MockState.Installed[0].PackageFullName] = 5
+    $Global:MockState.FailOnce[(Get-MockPackage 'Microsoft.WebpImageExtension').PackageFullName] = 5
     $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true }
     Assert 'e2e fail: one try, FAIL row explains ERROR_PACKAGES_IN_USE, exit 1, event 3001' ($Run.Exit -eq 1 -and (Calls 'Remove-AppxPackage Microsoft.Webp*').Count -eq 1 -and (Rows $Run 'FAIL' 'Microsoft.WebpImageExtension users')[0].Detail -like '*0x80073D02 ERROR_PACKAGES_IN_USE*' -and @($Global:MockState.Events | Where-Object { $_ -like '3001 *' }).Count -ge 1)
 
     # K11. 0x80073CF1 (already gone): WARN, continue, verified
     Reset-Mock
-    $Gone = $Global:MockState.Installed[2]
+    $Gone = Get-MockPackage 'Microsoft.RawImageExtension'
     $Global:MockState.FailOnce["gone:$($Gone.PackageFullName)"] = 1
     $Global:MockState.Installed = @($Global:MockState.Installed | Where-Object { $_.PackageFullName -ne $Gone.PackageFullName }) + @($Gone)   # still reported before, throws on removal
     $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true }
@@ -346,7 +366,7 @@ try {
 
     # K12. A refused blocker with -StopBlockingProcesses: STOP before any change
     Reset-Mock
-    $Global:MockState.Processes += @(New-FakeProcess 'svchost' 900 @("$($Global:MockState.Installed[0].InstallLocation)\WebpImageExtension.dll"))
+    $Global:MockState.Processes += @(New-FakeProcess 'svchost' 900 @("$((Get-MockPackage 'Microsoft.WebpImageExtension').InstallLocation)\WebpImageExtension.dll"))
     $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true; StopBlockingProcesses = $true }
     Assert 'e2e refuse: svchost holding a file stops the run before any change' ($Run.Exit -eq 1 -and (Rows $Run 'FAIL' 'Stopped')[0].Detail -like 'STOP: a process that must not be killed*svchost (PID 900)*' -and (Calls 'Remove-*').Count -eq 0 -and (Calls 'Stop-Process*').Count -eq 0)
 
@@ -371,8 +391,8 @@ try {
     New-Item -Path $Global:MockState.OfflineRoot -Force | Out-Null
     $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true; MountedImagePath = $Mount }
     $OfflineKeys = @(Get-ChildItem -LiteralPath "$($Global:MockState.OfflineRoot)\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\Deprovisioned" -ErrorAction SilentlyContinue | ForEach-Object { $_.PSChildName })
-    Assert 'e2e offline: three deprovisioned with -Path, none online, no Remove-AppxPackage' ((Calls "Remove-AppxProvisionedPackage * Online=False Path=$Mount").Count -eq 3 -and (Calls 'Remove-AppxProvisionedPackage * Online=True*').Count -eq 0 -and (Calls 'Remove-AppxPackage*').Count -eq 0)
-    Assert 'e2e offline: three keys written into the image hive, verified, exit 0' ($OfflineKeys.Count -eq 3 -and $Run.Exit -eq 0 -and (Rows $Run 'OK' '*verified').Count -eq 3 -and (Rows $Run 'OK' 'Mounted image').Count -eq 1)
+    Assert 'e2e offline: every target deprovisioned with -Path, none online, no Remove-AppxPackage' ((Calls "Remove-AppxProvisionedPackage * Online=False Path=$Mount").Count -eq $TargetCount -and (Calls 'Remove-AppxProvisionedPackage * Online=True*').Count -eq 0 -and (Calls 'Remove-AppxPackage*').Count -eq 0)
+    Assert 'e2e offline: one key per target written into the image hive, verified, exit 0' ($OfflineKeys.Count -eq $TargetCount -and $Run.Exit -eq 0 -and (Rows $Run 'OK' '*verified').Count -eq $TargetCount -and (Rows $Run 'OK' 'Mounted image').Count -eq 1)
     Assert 'e2e offline: no live Deprovisioned key touched, no process scan' (@(Get-ChildItem -LiteralPath $TestDeprovisioned).Count -eq 0 -and (Calls 'Get-AppxPackage*').Count -eq 0)
     $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true; MountedImagePath = "$env:SystemDrive\" }
     Assert 'e2e offline: the running OS as image path -> STOP' ($Run.Exit -eq 1 -and (Rows $Run 'FAIL' 'Stopped')[0].Detail -like '*running operating system*')
@@ -385,7 +405,7 @@ try {
     try { $null = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true } } catch { $GuardMessage = "$($_.Exception.Message)" }
     Remove-Module -Name CodecFakeRealModule -Force -ErrorAction SilentlyContinue
     Assert 'e2e guard: the script refuses harness mode when Remove-AppxPackage comes from a module' ($GuardMessage -like 'STOP: test harness mode, but ''Remove-AppxPackage'' would run for real (Function from CodecFakeRealModule)*') $GuardMessage
-    Assert 'e2e guard: nothing was called or changed' ((Calls '*').Count -eq 0 -and $Global:MockState.Installed.Count -eq 4 -and @(Get-ChildItem -LiteralPath $TestDeprovisioned).Count -eq 0)
+    Assert 'e2e guard: nothing was called or changed' ((Calls '*').Count -eq 0 -and $Global:MockState.Installed.Count -eq ($TargetCount + 1) -and @(Get-ChildItem -LiteralPath $TestDeprovisioned).Count -eq 0)
 }
 finally {
     foreach ($F in 'Read-Host', 'Test-Interactive', 'Test-CodecElevated', 'Test-CodecSystemAccount', 'Get-CodecOsInfo', 'Initialize-CodecModules', 'Get-CodecStoreAccess', 'Write-CodecEvent', 'Get-AppxPackage', 'Remove-AppxPackage', 'Get-AppxProvisionedPackage', 'Remove-AppxProvisionedPackage', 'Get-Process', 'Stop-Process', 'Start-Sleep', 'Start-Process', 'Use-CodecOfflineHive') { Remove-Item -LiteralPath "Function:\$F" -ErrorAction SilentlyContinue }

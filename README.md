@@ -1,10 +1,10 @@
 # WIN11-CODEC-REMOVAL - remove the Microsoft Store codec packages from Windows 11
 
 > [!NOTE]
-> **`scripts\Remove-CodecExtension.ps1`** removes the Store-delivered codec packages that keep appearing in vulnerability scans - **WebP Image Extension**, **HEVC Video Extensions** and **Raw Image Extension** by default - from a Windows 10/11 computer or from a **mounted golden image**: for **every user profile**, from the **provisioning list**, and with the **registry key that stops feature updates from bringing them back**. It needs only the inbox Appx and Dism modules and an elevated session. Written for **PowerShell 7**; also runs in **Windows PowerShell 5.1**. **Read-only by default** (`-Mode Check`), asks **Y/N** before any change, supports **`-WhatIf`** and **`-NoConfirm`**, verifies the result from the system, and leaves a transcript, a CSV of PASS/WARN/FAIL rows, an inventory JSON (before and after) and Application events.
+> **`scripts\Remove-CodecExtension.ps1`** removes the Store-delivered codec packages that keep appearing in vulnerability scans - **WebP Image Extension**, **HEVC Video Extensions**, **Raw Image Extension** and **HEIF Image Extensions** by default - from a Windows 10/11 computer or from a **mounted golden image**: for **every user profile**, from the **provisioning list**, and with the **registry key that stops feature updates from bringing them back**. It needs only the inbox Appx and Dism modules and an elevated session. Written for **PowerShell 7**; also runs in **Windows PowerShell 5.1**. **Read-only by default** (`-Mode Check`), asks **Y/N** before any change, supports **`-WhatIf`** and **`-NoConfirm`**, verifies the result from the system, and leaves a transcript, a CSV of PASS/WARN/FAIL rows, an inventory JSON (before and after) and Application events.
 
 > [!IMPORTANT]
-> **Verified live on 2026-10-26** on a Windows 11 Enterprise computer (build 28000), both editions: the three packages were **removed for every user, deprovisioned and keyed** in three seconds (AppX deployment events 603/400/472), the HEVC package went **even though Edge and three WebView2 hosts had its decoder DLL loaded**, `-Mode Check` then reported every target "not installed, not provisioned, Deprovisioned key present" and a second `-Mode Remove` reported **Already current** without prompting. The removal path is also proven by **103 tests against mocked Appx/DISM/process commands** ([`tests/`](tests/Test-CodecRemoval.ps1)) in both editions. Honest note: that live removal was triggered by an **intermediate test run** whose harness still let the real DISM module through, not by a deliberate confirmed run; the harness now **refuses to run** unless every system command resolves to a mock (test K0 and the script's own guard). Details in [Appendix A](#appendix-a--live-run-2026-10-26).
+> **Verified live on 2026-10-26** on a Windows 11 Enterprise computer (build 28000), both editions: the three packages were **removed for every user, deprovisioned and keyed** in three seconds (AppX deployment events 603/400/472), the HEVC package went **even though Edge and three WebView2 hosts had its decoder DLL loaded**, `-Mode Check` then reported every target "not installed, not provisioned, Deprovisioned key present" and a second `-Mode Remove` reported **Already current** without prompting. The removal path is also proven by **108 tests against mocked Appx/DISM/process commands** ([`tests/`](tests/Test-CodecRemoval.ps1)) in both editions. Honest note: that live removal was triggered by an **intermediate test run** whose harness still let the real DISM module through, not by a deliberate confirmed run; the harness now **refuses to run** unless every system command resolves to a mock (test K0 and the script's own guard). Details in [Appendix A](#appendix-a--live-run-2026-10-26). **HEIF Image Extensions** became the fourth default target later that evening; on that computer it was only checked and planned (`-Mode Check`, `-WhatIf`), not removed.
 
 ---
 
@@ -41,11 +41,11 @@ Microsoft moved these decoders out of the OS into Store packages so they could b
 | `Microsoft.WebpImageExtension` | WebP Image Extension | 9PG2DK419DRG | `.webp` images (WIC) | provisioned by Windows setup |
 | `Microsoft.HEVCVideoExtension` | HEVC Video Extensions from Device Manufacturer | 9N4WGH0Z6VHQ | H.265/HEVC video; `.heic` photos through HEIF | provisioned by setup or the OEM |
 | `Microsoft.RawImageExtension` | Raw Image Extension | 9NCTDW2W1BH8 | camera RAW (`.cr2`, `.nef`, `.arw`, `.dng` ...) (WIC) | provisioned by Windows setup |
+| `Microsoft.HEIFImageExtension` | HEIF Image Extensions | 9PMMSR1CGPWG | `.heic`, `.heif` and `.avif` containers; the picture inside needs HEVC or AV1 (WIC) | provisioned by Windows setup |
 | `Microsoft.HEVCVideoExtensions` | HEVC Video Extensions (paid) | 9NMZLZ57R3T7 | the same decoder | bought by a user |
-| `Microsoft.HEIFImageExtension` | HEIF Image Extensions | 9PMMSR1CGPWG | `.heic`/`.heif` containers (needs HEVC) | provisioned by Windows setup |
 | `Microsoft.AV1VideoExtension`, `Microsoft.VP9VideoExtensions`, `Microsoft.MPEG2VideoExtension`, `Microsoft.WebMediaExtensions` | AV1, VP9, MPEG-2, Web Media | see `scripts\Codec-Common.ps1` | other video/audio formats | provisioned by Windows setup |
 
-The first three are the script's default targets. Every row is accepted by `-Package`; anything else is rejected by `ValidateSet`. Store IDs were checked on 2026-10-26 (apps.microsoft.com, Microsoft Learn, winget).
+The first four are the script's default targets. Every row is accepted by `-Package`; anything else is rejected by `ValidateSet`. Store IDs were checked on 2026-10-26 (apps.microsoft.com, Microsoft Learn, winget).
 
 ## 2. Why they are always "vulnerable"
 
@@ -62,6 +62,7 @@ Removing the packages ends all three problems. Keeping them means fixing the upd
 - Opening `.webp` files in Photos, Paint, Snipping Tool; Explorer thumbnails for `.webp`. Drag the file into a browser instead, browsers have their own decoder.
 - H.265/HEVC video in Photos, Media Player, Movies & TV, **Edge** and WebView2 apps (Edge decodes HEVC only through the Windows platform decoder, [Microsoft Learn](https://learn.microsoft.com/troubleshoot/microsoft-edge/development/video-playback-issues)); `.heic` photos from iPhones. No browser renders `.heic`; set iPhones to *Most Compatible* or convert on transfer.
 - Camera RAW previews in Photos and Explorer. Photo editors bring their own RAW decoder.
+- `.heif` and `.avif` pictures in Photos and Explorer thumbnails; HEIF Image Extensions is the container reader for them. Browsers render AVIF with their own decoder.
 
 **Not affected**
 
@@ -76,7 +77,7 @@ Removing the packages ends all three problems. Keeping them means fixing the upd
 | [`scripts/Remove-CodecExtension.ps1`](scripts/Remove-CodecExtension.ps1) | The script. Comment-based help: `Get-Help .\Remove-CodecExtension.ps1 -Full`. |
 | [`scripts/Codec-Common.ps1`](scripts/Codec-Common.ps1) | Shared functions and the package catalog (names, Store IDs, origin, what breaks). Pure, dot-sourced by the script and the tests. |
 | [`scripts/Confirm-Change.ps1`](scripts/Confirm-Change.ps1) | The confirmation gate: yellow summary, `Continue? [Y/N]`, `-NoConfirm`, never hangs in a non-interactive session. |
-| [`tests/Test-CodecRemoval.ps1`](tests/Test-CodecRemoval.ps1) | 103 tests, no Pester needed, both editions; nothing on the computer is changed. |
+| [`tests/Test-CodecRemoval.ps1`](tests/Test-CodecRemoval.ps1) | 108 tests, no Pester needed, both editions; nothing on the computer is changed. |
 | [`docs/GOLDEN-IMAGE.md`](docs/GOLDEN-IMAGE.md) | Runbook: reference computer in audit mode, offline WIM/VHDX, Intune / ConfigMgr / GPO, keeping them gone. |
 | `Logs/`, `Outputs/` | Created on first run: transcripts + CSV, inventory JSON. Git-ignored. |
 
@@ -126,13 +127,38 @@ After deployment, `-Mode Check` (exit code 1 = drift) is the compliance check, a
 | Parameter | Default | Meaning |
 |---|---|---|
 | `-Mode Check\|Remove` | `Check` | Check is read-only and exits 1 while a target is present. Remove performs the removal. |
-| `-Package <names>` | WebP, HEVC, Raw | Which packages. Only the catalog names are accepted (see section 1). |
+| `-Package <names>` | WebP, HEVC, Raw, HEIF | Which packages. Only the catalog names are accepted (see section 1). |
 | `-MountedImagePath <folder>` | empty = running OS | Offline servicing of a mounted image. The running OS is refused. |
 | `-StopBlockingProcesses` | off | Stop the processes that hold a package file first; Explorer is restarted. Without it a package in use is FAIL and skipped. |
 | `-LogPath`, `-OutputPath` | `<folder>\Logs`, `<folder>\Outputs` | Transcript + CSV, inventory JSON. Point them at `%ProgramData%` when deploying from a read-only share. |
 | `-NoConfirm` | off | No prompt; the plan is still printed and transcribed. Required for unattended runs. |
 | `-WhatIf` | off | Plan only, nothing changed, nothing asked. |
 | `-DeprovisionedKeyRoot` | the real key | Tests only. |
+
+### Changing the default targets
+
+Everything in this folder runs in Windows PowerShell 5.1 or PowerShell 7 alone: the script, the tests and the maintenance steps below. No other shell or tool is needed, apart from `git` if you keep the folder in a repository.
+
+- **For one run**, pass `-Package` and change nothing. For example, to keep HEIF, run this in `scripts\`:
+
+  ```powershell
+  .\Remove-CodecExtension.ps1 -Mode Remove -Package Microsoft.WebpImageExtension, Microsoft.HEVCVideoExtension, Microsoft.RawImageExtension
+  ```
+
+- **For good**, edit the default list where it is defined, with any editor. There are two places, and they must be identical and in the same order (a test fails otherwise):
+  - `$CodecDefaultPackages` in `scripts\Codec-Common.ps1`
+  - the `-Package` default in the `param()` block of `scripts\Remove-CodecExtension.ps1`
+
+  A name must already be in the catalog (`$CodecCatalog`) and in the `-Package` `ValidateSet`; the tests check both. The tests take every count from the list, so they need no edit. The end-to-end tests model the in-use and retry cases on WebP, HEVC and Raw, so those three stay in the list (the tests stop with a message otherwise). Then, from the folder root, find the text that names the defaults, run the tests in both editions and review the change:
+
+  ```powershell
+  Select-String -Path .\scripts\*.ps1, .\README.md, .\docs\*.md -Pattern 'RawImageExtension|Raw Image Extension'
+  pwsh       -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\tests\Test-CodecRemoval.ps1
+  powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\tests\Test-CodecRemoval.ps1
+  git diff --stat
+  ```
+
+  Keep the files ASCII-only; the tests check that too.
 
 ## 10. Evidence
 
@@ -152,7 +178,7 @@ pwsh       -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\tests\Test
 powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\tests\Test-CodecRemoval.ps1
 ```
 
-Expected last line: `ALL 103 TESTS PASSED`. Groups: parse + ASCII of every script; the catalog; family names from full, provisioned and bare names; HRESULT texts; "in use" detection against fake processes and the stop/restart/refuse rule; the plan for every installed/provisioned/keyed combination; mounted-image validation; the Deprovisioned key with `-WhatIf`; a real offline hive (`reg.exe save`, load, write, unload, read back - elevated sessions); the confirmation gate (Y, yes, N, invalid x3, non-interactive, `-NoConfirm`); and 16 end-to-end runs of the script against mocked Appx, DISM and process commands (Check, WhatIf, the non-interactive STOP, a full removal with verification, in-use with and without `-StopBlockingProcesses`, the 0x80073D02 retry, 0x80073CF1, already current, a refused blocker, not elevated, an old build, `-Package`, a sideloaded publisher, offline mode, and the guard that refuses harness mode if any system command is real). Run with `-NonInteractive` so the non-interactive STOP is meaningful.
+Expected last line: `ALL 108 TESTS PASSED` (one test per default target checks its catalog entry, so the number moves with the list). Groups: parse + ASCII of every script; the catalog; family names from full, provisioned and bare names; HRESULT texts; "in use" detection against fake processes and the stop/restart/refuse rule; the plan for every installed/provisioned/keyed combination; mounted-image validation; the Deprovisioned key with `-WhatIf`; a real offline hive (`reg.exe save`, load, write, unload, read back - elevated sessions); the confirmation gate (Y, yes, N, invalid x3, non-interactive, `-NoConfirm`); and 16 end-to-end runs of the script against mocked Appx, DISM and process commands (Check, WhatIf, the non-interactive STOP, a full removal with verification, in-use with and without `-StopBlockingProcesses`, the 0x80073D02 retry, 0x80073CF1, already current, a refused blocker, not elevated, an old build, `-Package`, a sideloaded publisher, offline mode, and the guard that refuses harness mode if any system command is real). Run with `-NonInteractive` so the non-interactive STOP is meaningful.
 
 ## 13. Troubleshooting
 
@@ -192,5 +218,7 @@ Computer: Windows 11 Enterprise 26H1, build 28000, PowerShell 7.6.9 and 5.1.2800
 - **21:12** - `-Mode Remove` non-interactive without `-NoConfirm` (Windows PowerShell 5.1): *Already current*, no prompt needed, exit 0. Snapshot before and after identical.
 - **21:24 / 21:27** - `-Mode Remove -WhatIf` in both editions: *Already current*, modules loaded (`Appx: native; Dism: Windows PowerShell compatibility` in 7, both native in 5.1), state unchanged.
 - Edge and the WebView2 hosts still show the DLL mapped from the old path; the folder now lives under `WindowsApps\Deleted\` until those processes exit. Nothing needed a reboot.
+- **23:39** - HEIF Image Extensions added as the fourth default target. `-Mode Check` (PowerShell 7): WebP, HEVC and Raw clean; HEIF *PRESENT - installed 1.2.48.0 for both accounts; provisioned; no Deprovisioned key*; exit 1. **23:41** - `-Mode Remove -WhatIf` (Windows PowerShell 5.1): the three HEIF steps planned, nothing changed. HEIF stays installed until a confirmed `-Mode Remove`.
+- **23:45** - Edge restarted. It was running in its startup-boost background mode with no window. All `msedge` processes were stopped and Edge was started again with `--no-startup-window` through a one-shot scheduled task with *RunLevel Limited*, so the browser did not inherit the elevated session's token; the task was deleted right after. Edge no longer maps `hevcdecoder_store.dll`. The WebView2 hosts of Widgets, Windows Search and Microsoft 365 Copilot still do until those apps restart or the user signs out.
 
 Generative AI was used in the creation and validation of this project; the result was reviewed and run by a person.

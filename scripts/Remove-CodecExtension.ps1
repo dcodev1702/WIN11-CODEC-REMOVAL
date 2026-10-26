@@ -1,9 +1,9 @@
 <#
 .SYNOPSIS
     Removes the Microsoft Store codec packages that keep showing up in vulnerability scans - WebP Image Extension,
-    HEVC Video Extensions and Raw Image Extension by default - from a Windows 10/11 computer or from a mounted
-    golden image: for every user profile, from the provisioning list, and with the registry key that stops feature
-    updates from bringing them back. Read-only by default (-Mode Check).
+    HEVC Video Extensions, Raw Image Extension and HEIF Image Extensions by default - from a Windows 10/11 computer
+    or from a mounted golden image: for every user profile, from the provisioning list, and with the registry key
+    that stops feature updates from bringing them back. Read-only by default (-Mode Check).
 
 .DESCRIPTION
     WHAT THESE PACKAGES ARE AND WHERE THEY COME FROM
@@ -18,13 +18,14 @@
       written in C/C++ (libwebp, LibRaw, Microsoft's HEVC decoder), which is why a new remote-code-execution CVE
       against them appears every few months and why a fleet whose Store updates are off stays "vulnerable" forever.
 
-      Default targets (the scanner hits):
+      Default targets (the scanner hits, plus HEIF, which decodes nothing once HEVC is gone):
         Microsoft.WebpImageExtension   WebP Image Extension                          Store 9PG2DK419DRG
         Microsoft.HEVCVideoExtension   HEVC Video Extensions from Device Manufacturer Store 9N4WGH0Z6VHQ
         Microsoft.RawImageExtension    Raw Image Extension                            Store 9NCTDW2W1BH8
-      Also allowed with -Package: Microsoft.HEVCVideoExtensions (the paid listing), Microsoft.HEIFImageExtension,
-      Microsoft.AV1VideoExtension, Microsoft.VP9VideoExtensions, Microsoft.MPEG2VideoExtension,
-      Microsoft.WebMediaExtensions. Anything else is rejected by ValidateSet.
+        Microsoft.HEIFImageExtension   HEIF Image Extensions                          Store 9PMMSR1CGPWG
+      Also allowed with -Package: Microsoft.HEVCVideoExtensions (the paid listing), Microsoft.AV1VideoExtension,
+      Microsoft.VP9VideoExtensions, Microsoft.MPEG2VideoExtension, Microsoft.WebMediaExtensions. Anything else is
+      rejected by ValidateSet.
 
     WHAT THE SCRIPT DOES (online, the running OS)
       1. Pre-flight, nothing changed: elevation, Windows build 17134+ (10 1803, where a deprovisioned package stays
@@ -79,7 +80,8 @@
 
 .PARAMETER Package
     Package names to handle. Default: Microsoft.WebpImageExtension, Microsoft.HEVCVideoExtension,
-    Microsoft.RawImageExtension. Only the codec packages listed in the catalog are accepted.
+    Microsoft.RawImageExtension, Microsoft.HEIFImageExtension. Only the codec packages listed in the catalog are
+    accepted. To keep HEIF, pass the first three names.
 
 .PARAMETER MountedImagePath
     Offline servicing: the folder a Windows image is mounted at (Mount-WindowsImage -Path). Empty (default) means
@@ -109,7 +111,7 @@
 
 .EXAMPLE
     .\Remove-CodecExtension.ps1
-    Read-only: which of the three packages are installed (for whom), provisioned, keyed, and which processes hold
+    Read-only: which of the four packages are installed (for whom), provisioned, keyed, and which processes hold
     them. Exit code 1 while any is present.
 
 .EXAMPLE
@@ -118,7 +120,7 @@
 
 .EXAMPLE
     .\Remove-CodecExtension.ps1 -Mode Remove
-    Removes the three packages for every user, deprovisions them and writes the keys, after Continue? [Y/N].
+    Removes the four packages for every user, deprovisions them and writes the keys, after Continue? [Y/N].
     A package held by a running process is reported and skipped.
 
 .EXAMPLE
@@ -126,8 +128,9 @@
     Unattended removal that first closes Edge, WebView2 hosts and anything else holding a package file.
 
 .EXAMPLE
-    .\Remove-CodecExtension.ps1 -Mode Remove -Package Microsoft.WebpImageExtension, Microsoft.RawImageExtension, Microsoft.HEIFImageExtension -NoConfirm
-    A different set of packages.
+    .\Remove-CodecExtension.ps1 -Mode Remove -Package Microsoft.HEIFImageExtension -NoConfirm
+    Only HEIF Image Extensions, for example on a computer where the other three are already gone. -Package limits
+    the run to the names given.
 
 .EXAMPLE
     Mount-WindowsImage -ImagePath D:\Images\install.wim -Index 3 -Path C:\Mount
@@ -168,7 +171,7 @@ param(
     [string]$Mode = 'Check',
 
     [ValidateSet('Microsoft.WebpImageExtension', 'Microsoft.HEVCVideoExtension', 'Microsoft.HEVCVideoExtensions', 'Microsoft.RawImageExtension', 'Microsoft.HEIFImageExtension', 'Microsoft.AV1VideoExtension', 'Microsoft.VP9VideoExtensions', 'Microsoft.MPEG2VideoExtension', 'Microsoft.WebMediaExtensions')]
-    [string[]]$Package = @('Microsoft.WebpImageExtension', 'Microsoft.HEVCVideoExtension', 'Microsoft.RawImageExtension'),
+    [string[]]$Package = @('Microsoft.WebpImageExtension', 'Microsoft.HEVCVideoExtension', 'Microsoft.RawImageExtension', 'Microsoft.HEIFImageExtension'),
 
     [string]$MountedImagePath = '',
     [switch]$StopBlockingProcesses,
@@ -354,7 +357,7 @@ try {
                 Confirm-Change -NoConfirm:$NoConfirm -Action "REMOVE $($Work.Count) codec package(s) on $env:COMPUTERNAME$(if ($Offline) { ' (mounted image)' })" -Detail $Detail.ToArray()
                 $ConfirmPreference = 'None'
             }
-            else { Write-Host ''; Write-Host "WhatIf - the plan for $env:COMPUTERNAME:" -ForegroundColor Yellow; foreach ($D in $Detail) { Write-Host "  $D" -ForegroundColor Yellow } }
+            else { Write-Host ''; Write-Host "WhatIf - the plan for $($env:COMPUTERNAME):" -ForegroundColor Yellow; foreach ($D in $Detail) { Write-Host "  $D" -ForegroundColor Yellow } }
 
             # ---- 4. Evidence before, then apply
             $Before = Write-CodecInventory -Suffix 'before' -PlanRows $Plan -BlockerRows $Blockers

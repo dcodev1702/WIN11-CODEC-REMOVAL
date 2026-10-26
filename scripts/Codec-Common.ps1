@@ -52,7 +52,7 @@ $CodecPublisherId = '8wekyb3d8bbwe'
 $CodecMinimumBuild = 17134      # Windows 10 1803: a deprovisioned package stays removed across feature updates
 $CodecDeprovisionedKeyRoot = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\Deprovisioned'
 $CodecEventSource = 'CodecExtensionRemoval'
-$CodecDefaultPackages = @('Microsoft.WebpImageExtension', 'Microsoft.HEVCVideoExtension', 'Microsoft.RawImageExtension')
+$CodecDefaultPackages = @('Microsoft.WebpImageExtension', 'Microsoft.HEVCVideoExtension', 'Microsoft.RawImageExtension', 'Microsoft.HEIFImageExtension')
 $CodecCatalog = @(
     [pscustomobject]@{
         Name = 'Microsoft.WebpImageExtension'; DisplayName = 'WebP Image Extension'; StoreId = '9PG2DK419DRG'

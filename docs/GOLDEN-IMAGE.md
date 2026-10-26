@@ -1,7 +1,8 @@
 # Golden image runbook: shipping Windows 11 without the codec packages
 
-Three ways to get an image, or a deployed fleet, without WebP Image Extension, HEVC Video Extensions and Raw Image
-Extension. All of them use `scripts\Remove-CodecExtension.ps1`; the README explains what it does and why.
+Three ways to get an image, or a deployed fleet, without WebP Image Extension, HEVC Video Extensions, Raw Image
+Extension and HEIF Image Extensions. All of them use `scripts\Remove-CodecExtension.ps1`; the README explains what it
+does and why.
 
 ## A. Reference computer in audit mode (recommended)
 
@@ -84,10 +85,12 @@ right it needs, and SYSTEM does not release a DLL another process holds.
   only; the other Store packages still auto-update. A packaged-app rule in AppLocker or App Control for Business that
   denies the package family names is the hard block:
   `Microsoft.WebpImageExtension_8wekyb3d8bbwe`, `Microsoft.HEVCVideoExtension_8wekyb3d8bbwe`,
-  `Microsoft.HEVCVideoExtensions_8wekyb3d8bbwe` (the paid listing), `Microsoft.RawImageExtension_8wekyb3d8bbwe`.
+  `Microsoft.HEVCVideoExtensions_8wekyb3d8bbwe` (the paid listing), `Microsoft.RawImageExtension_8wekyb3d8bbwe`,
+  `Microsoft.HEIFImageExtension_8wekyb3d8bbwe`.
 - `-Mode Check` is read-only, cheap and exits 1 on drift; schedule it or use it as the compliance detection.
-- HEIF Image Extensions decodes nothing useful once HEVC is gone; if the scanner flags it too, add
-  `-Package Microsoft.WebpImageExtension, Microsoft.HEVCVideoExtension, Microsoft.RawImageExtension, Microsoft.HEIFImageExtension`.
+- HEIF Image Extensions is a default target: it decodes nothing useful once HEVC is gone, and it is one more
+  Store-updated parser of untrusted files. To keep it, pass
+  `-Package Microsoft.WebpImageExtension, Microsoft.HEVCVideoExtension, Microsoft.RawImageExtension`.
 
 ## E. What a real removal looked like (2026-10-26, Windows 11 Enterprise build 28000, PowerShell 7)
 
