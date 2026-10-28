@@ -69,16 +69,44 @@ Detection (exit code 0 = compliant, 1 = a package is still present):
   administrative rights", "Whether or not a user is logged on".
 - **Group Policy startup script**: the install command with `-NoConfirm`. Startup scripts run before anyone signs in,
   so nothing holds the files and `-StopBlockingProcesses` is not needed.
-- **Logon-time or maintenance-window runs on a user's computer**: add `-StopBlockingProcesses` if the HEVC package
-  must go while Edge or WebView2 apps are open; it closes them (Explorer is restarted). Announce it.
+- **Logon-time or maintenance-window runs on a user's computer**: the removal is tried while Edge and the WebView2
+  hosts hold the HEVC decoder (on builds 28000 and 26300 it succeeds anyway). Add `-StopBlockingProcesses` for the
+  builds that refuse with `0x80073D02`: the holders are closed only after Windows has refused, and Explorer is
+  restarted. Announce it.
 - **Monitoring**: Application log, source `CodecExtensionRemoval`: 1001 per package removed and verified, 1002
-  nothing to do, 2001 package in use, 3000 run stopped, 3001 a removal failed. A 3001 with `0x80070005` names the
-  AppX activity ID; running the command again finished the package when this was seen (see E).
+  nothing to do, 2001 package in use (Windows refused with `0x80073D02`), 3000 run stopped, 3001 a removal failed.
+  A 3001 with `0x80070005` names the AppX activity ID; running the command again finished the package when this
+  was seen (see E).
 - **What else is on a computer**: `-ListPackages` lists every codec package the script can handle, its state, and
   the exact names to pass to `-Package`, and writes the list as CSV next to the inventory files.
 
-`psexec -s` or any other way to run as SYSTEM is not required for the removal; an elevated administrator has every
-right it needs, and SYSTEM does not release a DLL another process holds.
+### Running as SYSTEM from an administrator's session (`-RunAsSystem`)
+
+Intune, Configuration Manager and startup scripts already run the script as SYSTEM. For an administrator sitting at
+the computer (or on an intranet without a management agent), `-RunAsSystem` gives the same context:
+
+```powershell
+.\Remove-CodecExtension.ps1 -Mode Remove -RunAsSystem                                   # PsExec from tools\, Y/N first
+.\Remove-CodecExtension.ps1 -Mode Remove -RunAsSystem -StopBlockingProcesses -NoConfirm # unattended, closes holders only if Windows refuses
+.\Remove-CodecExtension.ps1 -Mode Remove -RunAsSystem -SystemLauncher ScheduledTask     # no PsExec: a one-shot task as SYSTEM
+```
+
+- The elevated session does the pre-flight, shows the plan, asks Y/N, then starts a child run as `NT AUTHORITY\SYSTEM`
+  in session 0 (Windows PowerShell 5.1, `-NoConfirm`), shows the child's step log live, merges the child's rows into
+  its own table (prefixed `[SYSTEM]`), verifies from the system and restarts Explorer if the SYSTEM session had to
+  stop it. Exit code 1 if anything failed.
+- Launcher: `tools\PsExec64.exe` when present and its SHA256 equals the pinned value (`-SystemLauncher Auto`,
+  default; falls back to the task when PsExec is absent or could not start the child), `PsExec` (insist), or
+  `ScheduledTask` (never PsExec). PsExec needs the `ADMIN$` share of the local computer (Server service running);
+  the task needs nothing. Some EDR products flag `PSEXESVC`; the task launcher avoids that.
+- The folder, `-LogPath` and `-OutputPath` must be on a local drive: a SYSTEM session has no access to mapped drives
+  or share credentials. Copy the folder to `C:\Temp\WIN11-CODEC-REMOVAL` first.
+- PsExec is not in source control (public repository, Sysinternals license): run `tools\Get-PsExec.ps1` on a
+  connected computer before copying the folder to the isolated network; `tools\THIRD-PARTY-NOTICES.md` has the
+  hashes and the license.
+- The removal itself does not need more rights than an elevated administrator has. What `-RunAsSystem` changes is
+  the session: no browser or WebView2 host of the signed-in user runs in session 0, and the child reports what
+  Windows answers from there. Both runs leave their logs, so the evidence of which session succeeded is in `Logs\`.
 
 ## D. Keeping them gone
 
@@ -116,3 +144,23 @@ right it needs, and SYSTEM does not release a DLL another process holds.
   The same command limited to HEIF finished it a few minutes later. An unattended run that hits this exits 1, and
   the next run is expected to complete the package the same way; that was seen interactively, not yet in a
   System-context deployment.
+
+## F. The SYSTEM runs (2026-10-28, Windows 11 Enterprise 26H2 build 26300)
+
+HEVC 2.5.33.0 installed and provisioned, two WebView2 hosts with `hevcdecoder_store.dll` loaded (the module scan and
+the Restart Manager query agreed), no Deprovisioned key.
+
+- `-Mode Remove -Package Microsoft.HEVCVideoExtension -RunAsSystem -NoConfirm` from an elevated Windows PowerShell
+  5.1 window: PsExec started the child as SYSTEM two seconds after the plan; the child found the same two holders,
+  `Remove-AppxPackage -AllUsers` succeeded on the first try (the DLL stays mapped in the WebView2 hosts, the folder
+  went to `WindowsApps\Deleted`), Windows deprovisioned the package by itself during that call, the key was already
+  present. The whole run took 33 seconds. The script's own `Remove-AppxProvisionedPackage` then answered
+  `0x80070002` because the entry was already gone; the script now re-reads the provisioning list and reports that
+  as done instead of FAIL (test K11b).
+- HEVC 2.5.48.0 reinstalled with `Restore-CodecExtension.ps1` (Store install API, 30 seconds), then
+  `-Mode Remove -Package Microsoft.HEVCVideoExtension -RunAsSystem -SystemLauncher ScheduledTask
+  -StopBlockingProcesses -NoConfirm`: the one-shot task ran the child as SYSTEM, the removal succeeded on the first
+  try (nothing had loaded the new copy yet, so nothing was stopped), verified, task deleted, exit 0, 18 seconds for
+  the child.
+- Afterwards HEVC was reinstalled again with `Restore-CodecExtension.ps1` and the Deprovisioned key deleted, so the
+  test computer is back where it started.

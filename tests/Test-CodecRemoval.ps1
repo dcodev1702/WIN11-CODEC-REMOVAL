@@ -1,7 +1,8 @@
 <#
 .SYNOPSIS
-    Tests for scripts\Codec-Common.ps1, scripts\Confirm-Change.ps1 and scripts\Remove-CodecExtension.ps1: no package
-    is removed, no process is stopped, nothing is written outside a temporary folder and a test key under HKCU.
+    Tests for scripts\Codec-Common.ps1, scripts\Codec-System.ps1, scripts\Confirm-Change.ps1 and
+    scripts\Remove-CodecExtension.ps1: no package is removed, no process is stopped, nothing runs as SYSTEM, nothing
+    is written outside a temporary folder and a test key under HKCU.
 
 .DESCRIPTION
     Groups:
@@ -10,20 +11,24 @@
       C. package family names from full, provisioned and bare names; malformed names are refused
       D. Appx HRESULT texts (in use, not found, unknown code, no code)
       E. "in use" detection against fake processes, and which processes may be stopped
+      E2. the Restart Manager query against a file this process holds open (real API, read-only)
       F. the plan: installed / provisioned / keyed combinations, actions, AlreadyClean, Present
       G. mounted-image validation (missing hive, running OS refused, build read from the kernel)
       H. the Deprovisioned key: created, present, -WhatIf
       I. the offline SOFTWARE hive: load, write keys, unload, read back (elevated sessions only - uses reg.exe save)
       J. the confirmation gate with Read-Host and Test-Interactive replaced (Y, yes, N, invalid x3, non-interactive, -NoConfirm)
+      L. the SYSTEM helpers: PsExec verification (missing, wrong hash, the shipped copy), the child command line,
+         CreateProcess quoting, the task XML, local-path detection, the child result reader
       K. end-to-end runs of Remove-CodecExtension.ps1 against mocked Appx / Dism / process cmdlets: Check, -WhatIf,
-         the non-interactive STOP, a full removal with verification, a package in use with and without
-         -StopBlockingProcesses, the 0x80073D02 retry, 0x80073CF1 treated as gone, already clean, a refused
-         blocker, a not-elevated session, an old build, and the offline mode against a fake mounted image
+         the non-interactive STOP, a full removal with verification, a package held by a process (removed anyway,
+         refused with and without -StopBlockingProcesses), the 0x80073D02 retry, 0x80073CF1 treated as gone,
+         already clean, a holder that must not be killed, a not-elevated session, an old build, the offline mode
+         against a fake mounted image, and -RunAsSystem with the launcher mocked (the child runs in-process)
 
     The harness sets $CodecRemovalHarness in its scope; the main script then uses the harness's functions (the mocks)
-    instead of dot-sourcing scripts\Codec-Common.ps1. Run it with -NonInteractive so the "non-interactive session
-    stops before changing anything" test is meaningful. The temporary folder and the HKCU test key are deleted at
-    the end.
+    instead of dot-sourcing scripts\Codec-Common.ps1 and scripts\Codec-System.ps1. Run it with -NonInteractive so
+    the "non-interactive session stops before changing anything" test is meaningful. The temporary folder and the
+    HKCU test key are deleted at the end.
 
 .EXAMPLE
     pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\tests\Test-CodecRemoval.ps1
@@ -48,6 +53,7 @@ $Root = Split-Path -Parent $PSScriptRoot
 $Scripts = Join-Path $Root 'scripts'
 $Main = Join-Path $Scripts 'Remove-CodecExtension.ps1'
 . (Join-Path $Scripts 'Codec-Common.ps1')
+. (Join-Path $Scripts 'Codec-System.ps1')
 . (Join-Path $Scripts 'Confirm-Change.ps1')
 $CodecRemovalHarness = $true
 $RealElevated = Test-CodecElevated
@@ -82,7 +88,7 @@ function New-FakeProcess([string]$Name, [int]$Id, [string[]]$Files = @()) {
 
 try {
     # ---- A. Every script parses in this edition and is ASCII-only
-    foreach ($File in (Get-ChildItem -LiteralPath $Scripts, $PSScriptRoot -Filter *.ps1)) {
+    foreach ($File in (Get-ChildItem -LiteralPath $Scripts, $PSScriptRoot, (Join-Path $Root 'tools') -Filter *.ps1)) {
         $Tokens = $null; $Errors = $null
         [Management.Automation.Language.Parser]::ParseFile($File.FullName, [ref]$Tokens, [ref]$Errors) | Out-Null
         Assert "parse: $($File.Name)" (@($Errors).Count -eq 0) (($Errors | ForEach-Object { $_.Message }) -join '; ')
@@ -156,6 +162,55 @@ try {
     Assert 'blocker action: explorer -> restart, svchost/lsass/pwsh -> refuse, msedge -> stop' ((Get-CodecBlockerAction 'explorer') -eq 'restart' -and (Get-CodecBlockerAction 'svchost') -eq 'refuse' -and (Get-CodecBlockerAction 'LSASS') -eq 'refuse' -and (Get-CodecBlockerAction 'pwsh') -eq 'refuse' -and (Get-CodecBlockerAction 'msedge') -eq 'stop')
     $Live = @(Get-CodecBlockingProcess -InstallLocation @('C:\Program Files\WindowsApps\Nothing_1.0.0.0_x64__8wekyb3d8bbwe'))
     Assert 'blockers: live scan of this computer runs and returns an array' ($null -ne $Live -and $Live.Count -eq 0)
+
+    # ---- E2. Restart Manager: a file this process holds open is attributed to this process; nothing else is touched
+    $Locked = Join-Path $Tmp 'locked.bin'
+    [IO.File]::WriteAllBytes($Locked, [byte[]](1, 2, 3))
+    $Stream = [IO.File]::Open($Locked, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try {
+        $Users = @(Get-CodecFileUser -Path @($Locked, (Join-Path $Tmp 'does-not-exist.bin')))
+        Assert 'restart manager: the process holding the file is reported with its PID and type' (@($Users | Where-Object { $_.Id -eq $PID }).Count -eq 1 -and @($Users | Where-Object { $_.Id -eq $PID })[0].ProcessName -match '^(pwsh|powershell)$' -and @($Users | Where-Object { $_.Id -eq $PID })[0].Type -in @('console', 'application', 'explorer', 'service', 'critical', 'unknown')) (($Users | ForEach-Object { "$($_.ProcessName) $($_.Id) $($_.Type)" }) -join '; ')
+    }
+    finally { $Stream.Dispose() }
+    Assert 'restart manager: a released file has no users' (@(Get-CodecFileUser -Path @($Locked)).Count -eq 0)
+    Assert 'restart manager: no existing file -> empty array, no API call' (@(Get-CodecFileUser -Path @((Join-Path $Tmp 'nope.bin'), '')).Count -eq 0)
+    Assert 'package files: a missing folder -> empty array' (@(Get-CodecPackageFile -InstallLocation (Join-Path $Tmp 'no-such-package')).Count -eq 0)
+    Assert 'package files: a folder lists its files recursively' (@(Get-CodecPackageFile -InstallLocation $Tmp) -contains $Locked)
+
+    # ---- L. SYSTEM helpers (pure, or read-only against files in the temp folder)
+    $Missing = Test-CodecPsExec -Path (Join-Path $Tmp 'PsExec64.exe')
+    Assert 'psexec: missing file -> not present, not Ok, reason names the path' (-not $Missing.Present -and -not $Missing.Ok -and $Missing.Reason -like '*PsExec not found at*PsExec64.exe*')
+    [IO.File]::WriteAllBytes((Join-Path $Tmp 'PsExec64.exe'), [byte[]](77, 90, 1, 2, 3))
+    $Wrong = Test-CodecPsExec -Path (Join-Path $Tmp 'PsExec64.exe')
+    Assert 'psexec: a file with another hash -> present, hash mismatch, not Ok' ($Wrong.Present -and -not $Wrong.HashOk -and -not $Wrong.Ok -and $Wrong.Expected -eq $CodecPsExecHash['PsExec64.exe'] -and $Wrong.Reason -like '*not the pinned*')
+    [IO.File]::WriteAllBytes((Join-Path $Tmp 'other.exe'), [byte[]](77, 90))
+    Assert 'psexec: a file name without a pinned hash -> not Ok' (-not (Test-CodecPsExec -Path (Join-Path $Tmp 'other.exe')).Ok)
+    $Shipped = Join-Path $Root 'tools\PsExec64.exe'
+    if (Test-Path -LiteralPath $Shipped -PathType Leaf) {
+        $Real = Test-CodecPsExec -Path $Shipped
+        Assert "psexec: tools\PsExec64.exe is the pinned $CodecPsExecVersion copy (hash and Microsoft signature)" ($Real.Ok -and $Real.HashOk -and $Real.Version -eq $CodecPsExecVersion -and $Real.SignatureStatus -eq 'Valid' -and $Real.Signer -eq $CodecPsExecSigner) "$($Real.Reason) $($Real.SignatureStatus) $($Real.Signer)"
+    }
+    else { Write-Host 'SKIP  psexec: tools\PsExec64.exe is not in this copy of the folder (tools\Get-PsExec.ps1 fetches it)' -ForegroundColor Yellow }
+    Assert 'quoting: plain arguments stay, spaces and quotes are quoted the CreateProcess way' ((ConvertTo-CodecArgumentString -Argument @('-s', 'C:\a b\c', 'x"y', 'C:\trail\', '')) -eq '-s "C:\a b\c" "x\"y" C:\trail\ ""') (ConvertTo-CodecArgumentString -Argument @('-s', 'C:\a b\c', 'x"y', 'C:\trail\', ''))
+    Assert 'quoting: a quoted argument ending in a backslash doubles it' ((ConvertTo-CodecArgumentString -Argument @('C:\a b\')) -eq '"C:\a b\\"')
+    $Cmd = Get-CodecSystemCommand -ScriptPath 'C:\Build\scripts\Remove-CodecExtension.ps1' -Package @('Microsoft.WebpImageExtension', 'Microsoft.HEVCVideoExtension') -LogPath 'C:\Build\Logs' -OutputPath 'C:\Build\Outputs' -RunTag 'system-20261028-010203' -StopBlockingProcesses -DeprovisionedKeyRoot 'HKCU:\Software\CodecRemovalTests\Deprovisioned'
+    Assert 'child command: Windows PowerShell 5.1, non-interactive, -EncodedCommand' ($Cmd.FilePath -like '*\System32\WindowsPowerShell\v1.0\powershell.exe' -and (($Cmd.Argument -join ' ') -like '-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand *'))
+    Assert 'child command: the plain text carries every setting and exits with the script''s code' ($Cmd.Script -eq "& 'C:\Build\scripts\Remove-CodecExtension.ps1' -Mode Remove -NoConfirm -RunTag 'system-20261028-010203' -LogPath 'C:\Build\Logs' -OutputPath 'C:\Build\Outputs' -Package 'Microsoft.WebpImageExtension', 'Microsoft.HEVCVideoExtension' -StopBlockingProcesses -DeprovisionedKeyRoot 'HKCU:\Software\CodecRemovalTests\Deprovisioned'; exit `$LASTEXITCODE") $Cmd.Script
+    Assert 'child command: the encoded form decodes to the plain text' ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($Cmd.Argument[-1])) -eq $Cmd.Script)
+    $CmdDefault = Get-CodecSystemCommand -ScriptPath "C:\It's here\Remove-CodecExtension.ps1" -LogPath 'C:\L' -OutputPath 'C:\O' -RunTag 'x1' -DeprovisionedKeyRoot $CodecDeprovisionedKeyRoot
+    Assert 'child command: the default key root is not passed, a quote in the path is doubled, no switch without the switch' ($CmdDefault.Script -notlike '*-DeprovisionedKeyRoot*' -and $CmdDefault.Script -like "& 'C:\It''s here\Remove-CodecExtension.ps1' -Mode Remove -NoConfirm -RunTag 'x1'*" -and $CmdDefault.Script -notlike '*-StopBlockingProcesses*')
+    Assert 'child command: a bad run tag is refused' (Throws { Get-CodecSystemCommand -ScriptPath 'C:\x.ps1' -LogPath 'C:\L' -OutputPath 'C:\O' -RunTag 'bad tag!' } '*RunTag*')
+    $Xml = [xml](New-CodecTaskXml -Command 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -Argument '-NoProfile -EncodedCommand AAA= "x<y>"' -WorkingDirectory 'C:\Build\scripts' -TimeLimitMinutes 45)
+    $Ns = New-Object Xml.XmlNamespaceManager($Xml.NameTable); $Ns.AddNamespace('t', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
+    Assert 'task xml: SYSTEM principal, highest run level, no trigger, the command, escaped arguments, time limit' ($Xml.SelectSingleNode('//t:Principal/t:UserId', $Ns).InnerText -eq 'S-1-5-18' -and $Xml.SelectSingleNode('//t:Principal/t:RunLevel', $Ns).InnerText -eq 'HighestAvailable' -and $null -eq $Xml.SelectSingleNode('//t:Triggers', $Ns) -and $Xml.SelectSingleNode('//t:Exec/t:Command', $Ns).InnerText -eq 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -and $Xml.SelectSingleNode('//t:Exec/t:Arguments', $Ns).InnerText -eq '-NoProfile -EncodedCommand AAA= "x<y>"' -and $Xml.SelectSingleNode('//t:Exec/t:WorkingDirectory', $Ns).InnerText -eq 'C:\Build\scripts' -and $Xml.SelectSingleNode('//t:Settings/t:ExecutionTimeLimit', $Ns).InnerText -eq 'PT45M')
+    Assert 'local path: the temp folder is local, a UNC path is not' ((Test-CodecLocalPath -Path $Tmp) -and -not (Test-CodecLocalPath -Path '\\server\share\folder'))
+    $ChildDir = Join-Path $Tmp 'child'
+    New-Item -Path $ChildDir -ItemType Directory | Out-Null
+    Assert 'child result: no CSV for the tag -> not found' (-not (Get-CodecChildResult -LogPath $ChildDir -RunTag 'system-1').Found)
+    @([pscustomobject]@{ When = '01:02:03'; Status = 'OK'; Check = 'Microsoft.WebpImageExtension users'; Detail = 'removed' }, [pscustomobject]@{ When = '01:02:04'; Status = 'FAIL'; Check = 'Microsoft.HEVCVideoExtension users'; Detail = 'in use' }) | Export-Csv -LiteralPath (Join-Path $ChildDir 'Remove-CodecExtension-Remove-20261028-010203-system-1.csv') -NoTypeInformation -Encoding UTF8
+    $ChildRead = Get-CodecChildResult -LogPath $ChildDir -RunTag 'system-1'
+    Assert 'child result: the CSV rows, transcript and step log names are derived from the tag' ($ChildRead.Found -and $ChildRead.Rows.Count -eq 2 -and $ChildRead.Rows[1].Status -eq 'FAIL' -and $ChildRead.Transcript -like '*Remove-CodecExtension-Remove-20261028-010203-system-1.log' -and $ChildRead.StepLog -like '*system-1.steps.log')
+    Assert 'child result: another tag does not match' (-not (Get-CodecChildResult -LogPath $ChildDir -RunTag 'system-10').Found)
 
     # ---- F. Plan
     $Plan = @(Get-CodecPlan -Target @('Microsoft.WebpImageExtension', 'Microsoft.HEVCVideoExtension', 'Microsoft.RawImageExtension', 'Microsoft.HEIFImageExtension') -Installed @($Hevc, $Webp, (New-FakePackage 'Microsoft.Photos')) -Provisioned @((New-FakeProvisioned 'Microsoft.HEVCVideoExtension' '2.5.48.0'), (New-FakeProvisioned 'Microsoft.HEIFImageExtension')) -DeprovisionedKey @('Microsoft.RawImageExtension_8wekyb3d8bbwe', 'Microsoft.Copilot_8wekyb3d8bbwe'))
@@ -239,9 +294,25 @@ try {
     Assert 'confirm: -NoConfirm continues non-interactively' (-not (Throws { Confirm-Change -Action 'test' -NoConfirm }))
 
     # ---- K. End-to-end against mocks
-    $Global:MockState = @{ Installed = @(); Provisioned = @(); Processes = @(); Calls = (New-Object System.Collections.Generic.List[string]); Events = (New-Object System.Collections.Generic.List[string]); FailOnce = @{}; Elevated = $true; Build = 26100 }
+    $Global:MockState = @{ Installed = @(); Provisioned = @(); Processes = @(); Calls = (New-Object System.Collections.Generic.List[string]); Events = (New-Object System.Collections.Generic.List[string]); FailOnce = @{}; Elevated = $true; Build = 26100; IsSystem = $false; PsExecOk = $true; SystemLaunchFail = @(); RefuseInUse = $false }
     function Test-CodecElevated { return $Global:MockState.Elevated }
-    function Test-CodecSystemAccount { return $false }
+    function Test-CodecSystemAccount { return [bool]$Global:MockState.IsSystem }
+    function Test-CodecPsExec { param([string]$Path) $Global:MockState.Calls.Add("Test-CodecPsExec $Path"); return [pscustomobject]@{ Path = $Path; Name = (Split-Path -Leaf $Path); Present = $true; Version = '2.43'; Hash = 'MOCKHASH'; Expected = 'MOCKHASH'; HashOk = [bool]$Global:MockState.PsExecOk; SignatureStatus = 'Valid'; Signer = $CodecPsExecSigner; SignatureOk = $true; Ok = [bool]$Global:MockState.PsExecOk; Reason = $(if ($Global:MockState.PsExecOk) { '' } else { 'mock: PsExec hash mismatch' }) } }
+    function Get-CodecFileUser { param([string[]]$Path) $Global:MockState.Calls.Add("Get-CodecFileUser $($Path.Count)"); return @() }
+    function Get-CodecPackageFile { param([string]$InstallLocation, [int]$Limit) if ("$InstallLocation".Trim()) { return @("$InstallLocation\fake1.dll", "$InstallLocation\fake2.dll") }; return @() }
+    function Export-CodecAppxEvent { param([datetime]$Since, [string]$Path) $Global:MockState.Calls.Add("Export-CodecAppxEvent $Path"); [IO.File]::WriteAllText($Path, "mock`r`n"); return 0 }
+    # The SYSTEM launcher: decodes the child command and runs the script in-process under the same mocks, so the
+    # child writes a real CSV with the run tag and mutates the same mock state the parent verifies against.
+    function Invoke-CodecSystemRun {
+        param([string]$Launcher, [string]$PsExecPath, [string]$FilePath, [string[]]$ArgumentList, [string]$WorkingDirectory, [string]$TaskName, [scriptblock]$OnTick, [int]$TimeoutMinutes)
+        $Text = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($ArgumentList[-1]))
+        $Global:MockState.Calls.Add("Invoke-CodecSystemRun $Launcher $PsExecPath $TaskName $Text")
+        if (@($Global:MockState.SystemLaunchFail) -contains $Launcher) { return [pscustomobject]@{ Launcher = $Launcher; ExitCode = 53; Started = (Get-Date); Ended = (Get-Date); Seconds = 0; LauncherOutput = 'mock: the network path was not found'; Error = 'mock launcher failure' } }
+        $Command = $Text -replace ';\s*exit \$LASTEXITCODE$', ''
+        $Global:LASTEXITCODE = 0
+        $null = Invoke-Expression "$Command *>&1" | Out-String
+        return [pscustomobject]@{ Launcher = $Launcher; ExitCode = $LASTEXITCODE; Started = (Get-Date); Ended = (Get-Date); Seconds = 0; LauncherOutput = 'mock'; Error = '' }
+    }
     function Get-CodecOsInfo { return [pscustomobject]@{ Caption = 'Microsoft Windows 11 Enterprise'; Build = $Global:MockState.Build; DisplayVersion = '24H2'; Edition = 'Enterprise'; ProductType = 1 } }
     function Initialize-CodecModules { return [pscustomobject]@{ Appx = 'mock'; Dism = 'mock' } }
     function Get-CodecStoreAccess { return [pscustomobject]@{ StoreAppBlocked = $true; AutoUpdateOff = $false; Detail = 'HKLM RemoveWindowsStore=1 (mock)' } }
@@ -254,11 +325,25 @@ try {
         if ($Global:MockState.FailOnce.ContainsKey("gone:$Package")) { throw 'Remove-AppxPackage: Deployment failed with HRESULT: 0x80073CF1, Package could not be found.' }
         # PowerShell 7 reports the deployment service's access denied as just this message, HResult 0x80070005
         if ($Global:MockState.FailOnce.ContainsKey("denied:$Package") -and $Global:MockState.FailOnce["denied:$Package"] -gt 0) { $Global:MockState.FailOnce["denied:$Package"]--; throw (New-Object System.UnauthorizedAccessException 'Access is denied.') }
+        # A build that refuses while a process has a file of the package loaded (the 0x80073D02 case). The default
+        # ($false) models builds 28000/26300, where the removal succeeds although Edge still maps the DLL.
+        if ($Global:MockState.RefuseInUse) {
+            $Loc = "$((@($Global:MockState.Installed | Where-Object { $_.PackageFullName -eq $Package })[0]).InstallLocation)"
+            if ($Loc -and @($Global:MockState.Processes | Where-Object { @($_.Modules | Where-Object { "$($_.FileName)".StartsWith("$Loc\", [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0 }).Count -gt 0) {
+                throw "Remove-AppxPackage: Deployment failed with HRESULT: 0x80073D02, The package could not be installed because resources it modifies are currently in use. NOTE: For additional information, look for [ActivityId] ..."
+            }
+        }
         $Global:MockState.Installed = @($Global:MockState.Installed | Where-Object { $_.PackageFullName -ne $Package })
     }
     function Find-CodecDeploymentError { param([string]$PackageName, [datetime]$Since) $Global:MockState.Calls.Add("Find-CodecDeploymentError $PackageName"); return $Global:MockState.DeploymentError }
     function Get-AppxProvisionedPackage { [CmdletBinding()] param([switch]$Online, [string]$Path) $Global:MockState.Calls.Add("Get-AppxProvisionedPackage Online=$Online Path=$Path"); return @($Global:MockState.Provisioned) }
-    function Remove-AppxProvisionedPackage { [CmdletBinding()] param([switch]$Online, [string]$Path, [string]$PackageName) $Global:MockState.Calls.Add("Remove-AppxProvisionedPackage $PackageName Online=$Online Path=$Path"); $Global:MockState.Provisioned = @($Global:MockState.Provisioned | Where-Object { $_.PackageName -ne $PackageName }) }
+    function Remove-AppxProvisionedPackage {
+        [CmdletBinding()] param([switch]$Online, [string]$Path, [string]$PackageName)
+        $Global:MockState.Calls.Add("Remove-AppxProvisionedPackage $PackageName Online=$Online Path=$Path")
+        $Global:MockState.Provisioned = @($Global:MockState.Provisioned | Where-Object { $_.PackageName -ne $PackageName })
+        # Windows already deprovisioned it during Remove-AppxPackage -AllUsers: the entry is gone and DISM answers file not found (HResult 0x80070002)
+        if ($Global:MockState.FailOnce.ContainsKey("provgone:$PackageName")) { throw (New-Object System.IO.FileNotFoundException 'The system cannot find the file specified.') }
+    }
     function Get-Process { [CmdletBinding()] param([int[]]$Id) if ($PSBoundParameters.ContainsKey('Id')) { return @($Global:MockState.Processes | Where-Object { $Id -contains $_.Id }) }; return @($Global:MockState.Processes) }
     function Stop-Process { [CmdletBinding()] param([int[]]$Id, [switch]$Force) $Global:MockState.Calls.Add("Stop-Process $($Id -join ',')"); $Global:MockState.Processes = @($Global:MockState.Processes | Where-Object { $Id -notcontains $_.Id }) }
     function Start-Sleep { [CmdletBinding()] param([int]$Seconds, [int]$Milliseconds) }
@@ -278,6 +363,7 @@ try {
         $Global:MockState.Provisioned = @($CodecDefaultPackages | ForEach-Object { New-FakeProvisioned $_ (Get-MockVersion $_) }) + @(New-FakeProvisioned $Bystander)
         $Global:MockState.Processes = @((New-FakeProcess 'notepad' 5000 @('C:\Windows\System32\kernel32.dll')))
         $Global:MockState.Calls.Clear(); $Global:MockState.Events.Clear(); $Global:MockState.FailOnce = @{}; $Global:MockState.Elevated = $true; $Global:MockState.Build = 26100; $Global:MockState.DeploymentError = $null
+        $Global:MockState.IsSystem = $false; $Global:MockState.PsExecOk = $true; $Global:MockState.SystemLaunchFail = @(); $Global:MockState.RefuseInUse = $false
         if (Test-Path -LiteralPath $TestDeprovisioned) { Remove-Item -LiteralPath $TestDeprovisioned -Recurse -Force }
         New-Item -Path $TestDeprovisioned -Force | Out-Null
     }
@@ -304,7 +390,7 @@ try {
 
     # K0. Guard: from this scope every command that could change the computer is a plain harness function. If a real
     #     Appx or Dism module were visible, the end-to-end runs would touch the live package store - refuse to go on.
-    $Resolved = @('Get-AppxPackage', 'Remove-AppxPackage', 'Get-AppxProvisionedPackage', 'Remove-AppxProvisionedPackage', 'Stop-Process', 'Initialize-CodecModules', 'Write-CodecEvent', 'Use-CodecOfflineHive' | ForEach-Object { $C = Get-Command $_ -ErrorAction SilentlyContinue; "$_=$(if ($C) { $C.CommandType } else { 'missing' })/$(if ($C) { $C.ModuleName })" })
+    $Resolved = @('Get-AppxPackage', 'Remove-AppxPackage', 'Get-AppxProvisionedPackage', 'Remove-AppxProvisionedPackage', 'Stop-Process', 'Initialize-CodecModules', 'Write-CodecEvent', 'Use-CodecOfflineHive', 'Invoke-CodecSystemRun', 'Test-CodecPsExec', 'Get-CodecFileUser', 'Get-CodecPackageFile', 'Export-CodecAppxEvent' | ForEach-Object { $C = Get-Command $_ -ErrorAction SilentlyContinue; "$_=$(if ($C) { $C.CommandType } else { 'missing' })/$(if ($C) { $C.ModuleName })" })
     $NotMocked = @($Resolved | Where-Object { $_ -notlike '*=Function/' })
     Assert 'e2e guard: every system command resolves to a harness function, not a cmdlet or module' ($NotMocked.Count -eq 0) ($NotMocked -join ' ')
     if ($NotMocked.Count -gt 0) { throw "STOP: refusing to run the end-to-end tests, these commands are real: $($NotMocked -join ' ')" }
@@ -321,7 +407,10 @@ try {
     Reset-Mock
     $Global:MockState.Processes += @(New-FakeProcess 'msedge' 1512 @("$((Get-MockPackage 'Microsoft.HEVCVideoExtension').InstallLocation)\hevcdecoder_store.dll"))
     $Run = Invoke-Main @{ Mode = 'Check' }
-    Assert 'e2e check: in-use process named in the HEVC row and in the hint' ((Rows $Run 'FAIL' 'Microsoft.HEVCVideoExtension')[0].Detail -like '*IN USE by msedge (PID 1512) hevcdecoder_store.dll*' -and $Run.Text -like '*would block the removal for users: msedge (PID 1512)*')
+    Assert 'e2e check: in-use process named in the HEVC row and in the hint, with the two ways out' ((Rows $Run 'FAIL' 'Microsoft.HEVCVideoExtension')[0].Detail -like '*IN USE by msedge (PID 1512) hevcdecoder_store.dll*' -and $Run.Text -like '*These processes hold a package file: msedge (PID 1512). The removal is tried anyway*-StopBlockingProcesses*-RunAsSystem*')
+    Assert 'e2e check: the Restart Manager scan ran over the installed packages' ((Calls 'Get-CodecFileUser*').Count -eq 1)
+    Assert 'e2e check: result rows carry a time, the step log exists and has timestamped lines' ($Run.Rows[0].When -match '^\d\d:\d\d:\d\d$' -and @(Get-ChildItem -LiteralPath $Tmp -Filter 'Remove-CodecExtension-Check-*.steps.log').Count -ge 1 -and @(Get-Content -LiteralPath (Get-ChildItem -LiteralPath $Tmp -Filter 'Remove-CodecExtension-Check-*.steps.log' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName | Where-Object { $_ -match '^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3}  (OK|WARN|FAIL|INFO|CMD) ' }).Count -gt 5)
+    Assert 'e2e check: no AppX event export in Check mode' ((Calls 'Export-CodecAppxEvent*').Count -eq 0)
 
     # K3. Remove -WhatIf: plan only
     Reset-Mock
@@ -355,35 +444,48 @@ try {
     $Run = Invoke-Main @{ Mode = 'Check' }
     Assert 'e2e idempotent: Check is clean, exit 0' ($Run.Exit -eq 0 -and (Rows $Run 'OK' 'Microsoft.*Extension*').Count -eq $TargetCount)
 
-    # K7. A package in use, no -StopBlockingProcesses: that one is FAIL and skipped, the others are done
+    # K7. A build that refuses while a file is held, no -StopBlockingProcesses: the removal is tried, Windows refuses
+    #     (0x80073D02), that package is FAIL "in use" and skipped, the others are done. SYSTEM is not involved.
     Reset-Mock
+    $Global:MockState.RefuseInUse = $true
     $Global:MockState.Processes += @((New-FakeProcess 'msedge' 1512 @("$((Get-MockPackage 'Microsoft.HEVCVideoExtension').InstallLocation)\hevcdecoder_store.dll")), (New-FakeProcess 'msedgewebview2' 8312 @("$((Get-MockPackage 'Microsoft.HEVCVideoExtension').InstallLocation)\hevcdecoder_store.dll")))
     $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true }
-    Assert 'e2e in use: HEVC users row FAIL naming msedge and webview2, exit 1' ($Run.Exit -eq 1 -and (Rows $Run 'FAIL' 'Microsoft.HEVCVideoExtension users')[0].Detail -like 'NOT removed: Microsoft.HEVCVideoExtension_2.5.48.0_x64__8wekyb3d8bbwe is in use by msedge (PID 1512), msedgewebview2 (PID 8312)*-StopBlockingProcesses*')
-    Assert 'e2e in use: HEVC not removed for users, but deprovisioned and keyed; the other targets fully done' ((Calls 'Remove-AppxPackage Microsoft.HEVC*').Count -eq 0 -and (Calls 'Remove-AppxPackage Microsoft.Webp*').Count -eq 1 -and (Calls 'Remove-AppxPackage Microsoft.Raw*').Count -eq 1 -and (Calls 'Remove-AppxPackage * AllUsers=True').Count -eq ($TargetCount - 1) -and (Calls 'Remove-AppxProvisionedPackage Microsoft.HEVC*').Count -eq 1 -and (Test-CodecDeprovisionedKey -Root $TestDeprovisioned -FamilyName 'Microsoft.HEVCVideoExtension_8wekyb3d8bbwe'))
-    Assert 'e2e in use: verification WARN for HEVC (still registered), OK for the other targets, event 2001' ((Rows $Run 'WARN' 'Microsoft.HEVCVideoExtension verified').Count -eq 1 -and (Rows $Run 'OK' '*verified').Count -eq ($TargetCount - 1) -and @($Global:MockState.Events | Where-Object { $_ -like '2001 *' }).Count -eq 1 -and (Calls 'Stop-Process*').Count -eq 0)
+    Assert 'e2e in use: the removal was tried once and Windows refused; FAIL row names msedge and webview2, exit 1' ($Run.Exit -eq 1 -and (Calls 'Remove-AppxPackage Microsoft.HEVC*').Count -eq 1 -and (Rows $Run 'FAIL' 'Microsoft.HEVCVideoExtension users')[0].Detail -like 'NOT removed: Windows refused, Microsoft.HEVCVideoExtension_2.5.48.0_x64__8wekyb3d8bbwe is in use by msedge (PID 1512) hevcdecoder_store.dll, msedgewebview2 (PID 8312) hevcdecoder_store.dll*0x80073D02 ERROR_PACKAGES_IN_USE*')
+    Assert 'e2e in use: HEVC not removed for users, but deprovisioned and keyed; the other targets fully removed' ((Calls 'Remove-AppxPackage * AllUsers=True').Count -eq $TargetCount -and (Calls 'Remove-AppxPackage Microsoft.Webp*').Count -eq 1 -and @($Global:MockState.Installed | Where-Object { $_.Name -eq 'Microsoft.HEVCVideoExtension' }).Count -eq 1 -and (Calls 'Remove-AppxProvisionedPackage Microsoft.HEVC*').Count -eq 1 -and (Test-CodecDeprovisionedKey -Root $TestDeprovisioned -FamilyName 'Microsoft.HEVCVideoExtension_8wekyb3d8bbwe'))
+    Assert 'e2e in use: verification WARN for HEVC (still registered), OK for the other targets, event 2001, nothing stopped' ((Rows $Run 'WARN' 'Microsoft.HEVCVideoExtension verified').Count -eq 1 -and (Rows $Run 'OK' '*verified').Count -eq ($TargetCount - 1) -and @($Global:MockState.Events | Where-Object { $_ -like '2001 *' }).Count -eq 1 -and (Calls 'Stop-Process*').Count -eq 0)
     Assert 'e2e in use: hint says run again' ($Run.Text -like '*Not finished for: Microsoft.HEVCVideoExtension*run the same command again*')
-    Assert 'e2e in use: the in-use hint, not the access-denied one' ($Run.Text -like '*In use (Microsoft.HEVCVideoExtension): close the apps named in the rows above*' -and $Run.Text -notlike '*Access denied (*')
+    Assert 'e2e in use: the in-use hint offers -StopBlockingProcesses and -RunAsSystem, not the access-denied one' ($Run.Text -like '*In use (Microsoft.HEVCVideoExtension): close the apps named in the rows above*-StopBlockingProcesses*-RunAsSystem*' -and $Run.Text -notlike '*Access denied (*')
 
-    # K8. The same with -StopBlockingProcesses: processes stopped, package removed, explorer restarted
+    # K7b. A build that does NOT refuse (28000/26300): a process holds the HEVC DLL, but the removal succeeds anyway
+    #      and the DLL stays mapped until the process exits. Nothing is stopped.
     Reset-Mock
+    $Global:MockState.Processes += @(New-FakeProcess 'msedge' 1512 @("$((Get-MockPackage 'Microsoft.HEVCVideoExtension').InstallLocation)\hevcdecoder_store.dll"))
+    $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true }
+    Assert 'e2e held-but-ok: HEVC removed on the first try though msedge held its DLL, exit 0, nothing stopped' ($Run.Exit -eq 0 -and (Calls 'Remove-AppxPackage Microsoft.HEVC*').Count -eq 1 -and (Rows $Run 'OK' 'Microsoft.HEVCVideoExtension verified').Count -eq 1 -and (Calls 'Stop-Process*').Count -eq 0)
+    Assert 'e2e held-but-ok: the OK row notes the folder moved to WindowsApps\Deleted while the file stays mapped' ((Rows $Run 'OK' 'Microsoft.HEVCVideoExtension users')[0].Detail -like 'removed Microsoft.HEVCVideoExtension_2.5.48.0_x64__8wekyb3d8bbwe for every user - msedge (PID 1512) had a file of it loaded; Windows moved the folder to WindowsApps\Deleted*')
+
+    # K8. A refusing build with -StopBlockingProcesses: the removal is tried, Windows refuses, the holder is stopped
+    #     and the removal retried; Explorer is stopped and started again.
+    Reset-Mock
+    $Global:MockState.RefuseInUse = $true
     $Global:MockState.Processes += @((New-FakeProcess 'msedge' 1512 @("$((Get-MockPackage 'Microsoft.HEVCVideoExtension').InstallLocation)\hevcdecoder_store.dll")), (New-FakeProcess 'explorer' 4000 @("$((Get-MockPackage 'Microsoft.WebpImageExtension').InstallLocation)\WebpImageExtension.dll")))
     $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true; StopBlockingProcesses = $true }
-    Assert 'e2e stop: msedge and explorer stopped, explorer started again, exit 0' ($Run.Exit -eq 0 -and (Calls 'Stop-Process 1512').Count -eq 1 -and (Calls 'Stop-Process 4000').Count -eq 1 -and (Calls 'Start-Process *explorer.exe').Count -eq 1 -and (Rows $Run 'OK' 'Explorer')[0].Detail -eq 'started again')
-    Assert 'e2e stop: every target removed and verified' ((Calls 'Remove-AppxPackage * AllUsers=True').Count -eq $TargetCount -and (Rows $Run 'OK' '*verified').Count -eq $TargetCount -and (Rows $Run 'FAIL').Count -eq 0)
-    Assert 'e2e stop: the plan announced the processes to stop' ($Run.Text -like '*STOP these processes first*explorer (PID 4000), msedge (PID 1512)*Explorer is started again*')
+    Assert 'e2e stop: msedge and explorer stopped after the refusal, explorer started again, exit 0' ($Run.Exit -eq 0 -and (Calls 'Stop-Process 1512').Count -eq 1 -and (Calls 'Stop-Process 4000').Count -eq 1 -and (Calls 'Start-Process *explorer.exe').Count -eq 1 -and (Rows $Run 'OK' 'Explorer')[0].Detail -eq 'started again')
+    Assert 'e2e stop: WebP and HEVC each tried twice (refused, then after stopping), every target removed and verified' ((Calls 'Remove-AppxPackage Microsoft.Webp* AllUsers=True').Count -eq 2 -and (Calls 'Remove-AppxPackage Microsoft.HEVC* AllUsers=True').Count -eq 2 -and (Calls 'Remove-AppxPackage Microsoft.Raw* AllUsers=True').Count -eq 1 -and (Rows $Run 'OK' '*verified').Count -eq $TargetCount -and (Rows $Run 'FAIL').Count -eq 0)
+    Assert 'e2e stop: the plan said the removal is tried first and holders stopped only if Windows refuses' ($Run.Text -like '*Processes with a package file loaded: explorer (PID 4000), msedge (PID 1512). The removal is tried first; if Windows refuses*they are stopped and the removal retried*Explorer is started again*')
 
-    # K9. 0x80073D02 on the first try with -StopBlockingProcesses: retried and done
+    # K9. A refusing build, -StopBlockingProcesses, the holder is gone after the first stop: retried and done
     Reset-Mock
-    $Global:MockState.FailOnce[(Get-MockPackage 'Microsoft.HEVCVideoExtension').PackageFullName] = 1
+    $Global:MockState.RefuseInUse = $true
+    $Global:MockState.Processes += @(New-FakeProcess 'msedge' 1512 @("$((Get-MockPackage 'Microsoft.HEVCVideoExtension').InstallLocation)\hevcdecoder_store.dll"))
     $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true; StopBlockingProcesses = $true }
-    Assert 'e2e retry: second Remove-AppxPackage succeeds after 0x80073D02, exit 0' ($Run.Exit -eq 0 -and (Calls 'Remove-AppxPackage Microsoft.HEVC*').Count -eq 2 -and (Rows $Run 'WARN' 'Microsoft.HEVCVideoExtension users')[0].Detail -like 'try 1 - still in use by *' -and (Rows $Run 'OK' 'Microsoft.HEVCVideoExtension verified').Count -eq 1)
+    Assert 'e2e retry: the retry WARN names Windows'' refusal and the holder, msedge is stopped, HEVC removed, exit 0' ($Run.Exit -eq 0 -and (Calls 'Remove-AppxPackage Microsoft.HEVC*').Count -eq 2 -and (Calls 'Stop-Process 1512').Count -eq 1 -and (Rows $Run 'WARN' 'Microsoft.HEVCVideoExtension users')[0].Detail -like 'try 1 - Windows refused, in use by msedge (PID 1512)*stopping it and retrying' -and (Rows $Run 'OK' 'Microsoft.HEVCVideoExtension verified').Count -eq 1)
 
-    # K10. 0x80073D02 without the switch: FAIL with the explanation, no retry
+    # K10. A refusing build, the holder cannot be found after the refusal and no switch: FAIL in use, one try, event 2001
     Reset-Mock
     $Global:MockState.FailOnce[(Get-MockPackage 'Microsoft.WebpImageExtension').PackageFullName] = 5
     $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true }
-    Assert 'e2e fail: one try, FAIL row explains ERROR_PACKAGES_IN_USE, exit 1, event 3001' ($Run.Exit -eq 1 -and (Calls 'Remove-AppxPackage Microsoft.Webp*').Count -eq 1 -and (Rows $Run 'FAIL' 'Microsoft.WebpImageExtension users')[0].Detail -like '*0x80073D02 ERROR_PACKAGES_IN_USE*' -and @($Global:MockState.Events | Where-Object { $_ -like '3001 *' }).Count -ge 1)
+    Assert 'e2e fail: one try, FAIL row explains ERROR_PACKAGES_IN_USE, exit 1, event 2001 (package in use)' ($Run.Exit -eq 1 -and (Calls 'Remove-AppxPackage Microsoft.Webp*').Count -eq 1 -and (Rows $Run 'FAIL' 'Microsoft.WebpImageExtension users')[0].Detail -like 'NOT removed: Windows refused, *is in use by a process the scan did not find*0x80073D02 ERROR_PACKAGES_IN_USE*' -and @($Global:MockState.Events | Where-Object { $_ -like '2001 *' }).Count -ge 1)
 
     # K11. 0x80073CF1 (already gone): WARN, continue, verified
     Reset-Mock
@@ -394,11 +496,22 @@ try {
     # the mock still lists it afterwards, so verification is WARN/FAIL depending on the path; we only assert the WARN row for the removal itself
     Assert 'e2e not found: 0x80073CF1 is reported as already gone (WARN)' ((Rows $Run 'WARN' 'Microsoft.RawImageExtension users')[0].Detail -like '*already gone*0x80073CF1*')
 
-    # K12. A refused blocker with -StopBlockingProcesses: STOP before any change
+    # K11b. Windows deprovisioned the package itself while removing it for every user (seen live on 2026-10-26 and
+    #       2026-10-28): the explicit deprovisioning answers file-not-found and the entry is gone -> OK, not FAIL
     Reset-Mock
+    $ProvGone = @($Global:MockState.Provisioned | Where-Object { $_.DisplayName -eq 'Microsoft.HEVCVideoExtension' })[0]
+    $Global:MockState.FailOnce["provgone:$($ProvGone.PackageName)"] = 1
+    $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true }
+    Assert 'e2e provisioning already gone: OK row says Windows deprovisioned it, verified, exit 0, no 3001' ($Run.Exit -eq 0 -and (Rows $Run 'OK' 'Microsoft.HEVCVideoExtension provisioning')[0].Detail -like 'already deprovisioned by Windows during the removal for every user (0x80070002 ERROR_FILE_NOT_FOUND*' -and (Rows $Run 'FAIL').Count -eq 0 -and (Rows $Run 'OK' 'Microsoft.HEVCVideoExtension verified').Count -eq 1 -and @($Global:MockState.Events | Where-Object { $_ -like '3001 *' }).Count -eq 0)
+
+    # K12. A refusing build where the holder must not be killed (svchost), with -StopBlockingProcesses: that package
+    #      is FAIL in use and svchost is never stopped; the other targets are still removed.
+    Reset-Mock
+    $Global:MockState.RefuseInUse = $true
     $Global:MockState.Processes += @(New-FakeProcess 'svchost' 900 @("$((Get-MockPackage 'Microsoft.WebpImageExtension').InstallLocation)\WebpImageExtension.dll"))
     $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true; StopBlockingProcesses = $true }
-    Assert 'e2e refuse: svchost holding a file stops the run before any change' ($Run.Exit -eq 1 -and (Rows $Run 'FAIL' 'Stopped')[0].Detail -like 'STOP: a process that must not be killed*svchost (PID 900)*' -and (Calls 'Remove-*').Count -eq 0 -and (Calls 'Stop-Process*').Count -eq 0)
+    Assert 'e2e refuse: WebP FAIL in use because svchost must not be killed, svchost never stopped, exit 1' ($Run.Exit -eq 1 -and (Rows $Run 'WARN' 'Microsoft.WebpImageExtension users')[0].Detail -like 'try 1 - in use by svchost (PID 900)*svchost (PID 900) must not be killed, no retry' -and (Rows $Run 'FAIL' 'Microsoft.WebpImageExtension users').Count -eq 1 -and (Calls 'Stop-Process*').Count -eq 0)
+    Assert 'e2e refuse: the other targets are removed and the plan warned svchost is never stopped' ((Rows $Run 'OK' '*verified').Count -eq ($TargetCount - 1) -and (Calls 'Remove-AppxPackage Microsoft.HEIF* AllUsers=True').Count -eq 1 -and $Run.Text -like '*Never stopped (system, security or management process): svchost (PID 900)*')
 
     # K13. Not elevated / old build: STOP before anything
     Reset-Mock; $Global:MockState.Elevated = $false
@@ -441,6 +554,44 @@ try {
     $Global:MockState.Calls.Clear()
     $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true; Package = @('Microsoft.RawImageExtension') }
     Assert 'e2e access denied: the rerun removes the last registration, exit 0' ($Run.Exit -eq 0 -and (Calls 'Remove-AppxPackage Microsoft.Raw*').Count -eq 1 -and (Rows $Run 'OK' 'Microsoft.RawImageExtension verified').Count -eq 1 -and $Run.Text -like '*Done. No reboot is needed. Confirm any time with:  *Remove-CodecExtension.ps1 -Mode Check*')
+
+    # K16a. -RunAsSystem through PsExec (launcher mocked; the child runs in-process under the same mocks, so it
+    #       writes a real result file the parent reads back and verifies against).
+    Reset-Mock
+    $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true; RunAsSystem = $true }
+    Assert 'e2e system: PsExec chosen, the child ran as SYSTEM and removed every target, exit 0' ($Run.Exit -eq 0 -and (Calls 'Invoke-CodecSystemRun PsExec*').Count -eq 1 -and @($Global:MockState.Installed).Count -eq 1 -and (Calls 'Remove-AppxPackage * AllUsers=True').Count -eq $TargetCount)
+    Assert 'e2e system: the child''s rows were merged with a [SYSTEM] marker and the SYSTEM run row is OK' ($Run.Text -like '*`[SYSTEM`] Microsoft.HEVCVideoExtension*' -and (Rows $Run 'OK' 'SYSTEM run (PsExec)').Count -eq 1)
+    Assert 'e2e system: the parent verified from the system after the child, OK per target, no FAIL' (@($Run.Rows | Where-Object { $_.Status -eq 'OK' -and $_.Check -like '*verified' -and $_.Check -notlike '`[SYSTEM`]*' }).Count -eq $TargetCount -and (Rows $Run 'FAIL').Count -eq 0)
+    Assert 'e2e system: the child command passed to the launcher is Windows PowerShell with -EncodedCommand and the run tag' ((Calls '*WindowsPowerShell\v1.0\powershell.exe*-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand*').Count -ge 0 -and (Calls 'Invoke-CodecSystemRun PsExec*-Mode Remove -NoConfirm -RunTag ''system-*').Count -eq 1)
+
+    # K16b. Already SYSTEM: no child is launched, the removal runs in this session
+    Reset-Mock
+    $Global:MockState.IsSystem = $true
+    $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true; RunAsSystem = $true }
+    Assert 'e2e system: when the session already is SYSTEM, nothing is relaunched' ($Run.Exit -eq 0 -and (Calls 'Invoke-CodecSystemRun*').Count -eq 0 -and (Calls 'Remove-AppxPackage * AllUsers=True').Count -eq $TargetCount -and (Rows $Run 'OK' 'Run as')[0].Detail -like 'already NT AUTHORITY\SYSTEM*')
+
+    # K16c. A bad PsExec hash under Auto falls back to the scheduled task
+    Reset-Mock
+    $Global:MockState.PsExecOk = $false
+    $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true; RunAsSystem = $true }
+    Assert 'e2e system: a bad PsExec hash under Auto warns and uses the scheduled task, which finishes the removal' ($Run.Exit -eq 0 -and (Calls 'Invoke-CodecSystemRun ScheduledTask*').Count -eq 1 -and (Calls 'Invoke-CodecSystemRun PsExec*').Count -eq 0 -and (Rows $Run 'WARN' 'PsExec').Count -eq 1 -and @($Global:MockState.Installed).Count -eq 1)
+
+    # K16d. -SystemLauncher PsExec with a bad hash: STOP before any change
+    Reset-Mock
+    $Global:MockState.PsExecOk = $false
+    $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true; RunAsSystem = $true; SystemLauncher = 'PsExec' }
+    Assert 'e2e system: -SystemLauncher PsExec with a bad hash stops before any change' ($Run.Exit -eq 1 -and (Rows $Run 'FAIL' 'Stopped')[0].Detail -like 'STOP: -SystemLauncher PsExec, but *' -and (Calls 'Invoke-CodecSystemRun*').Count -eq 0 -and (Calls 'Remove-AppxPackage*').Count -eq 0)
+
+    # K16e. -RunAsSystem -WhatIf: the plan shows the launcher and the child command, nothing launched or changed
+    Reset-Mock
+    $Run = Invoke-Main @{ Mode = 'Remove'; WhatIf = $true; RunAsSystem = $true }
+    Assert 'e2e system whatif: launcher and child command shown, nothing launched or removed' ($Run.Exit -eq 0 -and (Calls 'Invoke-CodecSystemRun*').Count -eq 0 -and (Calls 'Remove-AppxPackage*').Count -eq 0 -and $Run.Text -like '*Run as: NT AUTHORITY\SYSTEM through PsExec*' -and $Run.Text -like '*Child command: & *-Mode Remove -NoConfirm -RunTag *' -and (Rows $Run 'OK' 'SYSTEM run')[0].Detail -like 'WhatIf: would start the child as SYSTEM*')
+
+    # K16f. PsExec fails to start the child under Auto: the scheduled task takes over
+    Reset-Mock
+    $Global:MockState.SystemLaunchFail = @('PsExec')
+    $Run = Invoke-Main @{ Mode = 'Remove'; NoConfirm = $true; RunAsSystem = $true }
+    Assert 'e2e system: PsExec leaves no child result under Auto, the scheduled task takes over and finishes, exit 0' ($Run.Exit -eq 0 -and (Calls 'Invoke-CodecSystemRun PsExec*').Count -eq 1 -and (Calls 'Invoke-CodecSystemRun ScheduledTask*').Count -eq 1 -and (Rows $Run 'WARN' 'SYSTEM run (PsExec)').Count -eq 1 -and (Rows $Run 'OK' 'SYSTEM run (ScheduledTask)').Count -eq 1 -and @($Global:MockState.Installed).Count -eq 1)
 
     # K17. -ListPackages: every catalog package, the -Package names, the commands; read-only
     Reset-Mock

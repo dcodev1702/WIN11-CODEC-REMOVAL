@@ -32,6 +32,8 @@
       Get-CodecOsInfo              caption, build, display version, edition, product type
       Get-CodecStoreAccess         can users reach the Store and does it auto-update (policy values)
       Write-CodecEvent             an Application event from source CodecExtensionRemoval
+    The -RunAsSystem helpers (PsExec verification, the child command, the scheduled task, the Restart Manager
+    query, the AppX log export) are in Codec-System.ps1, dot-sourced after this file.
 
 .EXAMPLE
     . "$PSScriptRoot\Codec-Common.ps1"
@@ -131,6 +133,8 @@ $CodecHresultText = @{
     '0x80073D01' = 'ERROR_DEPLOYMENT_BLOCKED_BY_POLICY - a policy blocks app deployment on this computer'
     '0x80073D1A' = 'ERROR_DEPLOYMENT_BLOCKED_BY_USER_LOG_OFF - a user is signing out; retry'
     '0x80070032' = 'ERROR_NOT_SUPPORTED - this app is part of Windows and cannot be removed per user'
+    '0x80070002' = 'ERROR_FILE_NOT_FOUND - the package files or its provisioning entry are already gone (Windows deprovisions a package while removing it for every user)'
+    '0x80070003' = 'ERROR_PATH_NOT_FOUND - the package folder or its provisioning entry is already gone (Windows deprovisions a package while removing it for every user)'
     '0x80070005' = 'E_ACCESSDENIED - the app deployment service refused this step (the script already checked that the session is elevated); run the same command again, it finishes what is left'
 }
 
