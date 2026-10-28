@@ -5,9 +5,4 @@
 # Claude Code session files
 /.claude/
 
-# PsExec binaries: the Sysinternals license allows installing and using them on your devices but not publishing
-# them for others to copy, and this repository is public. tools\Get-PsExec.ps1 downloads and verifies them on a
-# connected computer; the folder you carry to the isolated network then contains them. To commit them anyway
-# (private repository), delete the next two lines.
-/tools/PsExec64.exe
-/tools/PsExec.exe
+
